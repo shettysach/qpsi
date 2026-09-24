@@ -1,0 +1,7 @@
+{
+  "psi_repo": "/path/to/Psi0",
+  "checkpoint": "psi0/sonic-checkpoints/multi-task.psi-dream.2609092156",
+  "seed": 0,
+  "samples": 5,
+  "inference_steps": 10
+}
