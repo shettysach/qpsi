@@ -1,7 +1,8 @@
 {
   "psi_repo": "/path/to/Psi0",
   "checkpoint": "psi0/sonic-checkpoints/multi-task.psi-dream.2609092156",
+  "validation_dataset": ".data/unifolm_sonic_lerobot_val",
   "seed": 0,
-  "samples": 5,
+  "samples": 100,
   "inference_steps": 10
 }

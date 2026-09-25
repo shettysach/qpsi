@@ -1,66 +1,56 @@
-# Ψ₀ BF16 reference for FP8 comparisons
+# Ψ₀/SONIC unquantized validation reference
 
-The first baseline records Ψ₀'s action outputs, parameter dtypes, latency, and peak GPU memory. Later FP8 runs should use the **same checkpoint, input, sampling steps, and seeds** and compare their actions with `actions.jsonl`. This is a numerical comparison on a fixed synthetic input; it does not measure validation loss or robot task success.
+Run the released `multi-task.psi-dream.2609092156` checkpoint on fixed examples from PSI's public [UniFolM SONIC validation archive](https://huggingface.co/datasets/USC-PSI-Lab/psi-data/blob/main/sonic/unifolm_sonic_lerobot_val.zip). Save its action chunks, flow matching loss, latency, and peak GPU allocation for later paired FP8 comparisons. This is an **unquantized reference**, not an all-BF16 model: the VLM weights are BF16, the action expert weights are FP32, and `predict_action()` uses BF16 autocast.
 
-## Set up one uv environment
+The public archive has 9 episodes and 4,688 frames. It includes 64 SONIC 1.0 body-token values and 14 hand actions per frame. The fine-tuned checkpoint predicts those 78 values plus 2 neck values. UniFolM has no neck targets, so this evaluation masks the 2 neck values when computing flow loss. Its images also come from a different camera domain than the Psi-Dream fine-tuning data. The result measures quantization degradation on **UniFolM SONIC**, not the authors' unavailable Psi-Dream validation loss or robot task success.
 
-Keep the [official Ψ₀ checkout](https://github.com/physical-superintelligence-lab/Psi0) beside this project. Edit [baseline_config.json](baseline_config.json) and set `psi_repo` to its absolute path. The checkout supplies model code; its `.venv`, dependency groups, and `uv.lock` are not used by this baseline.
+## Set up the single uv environment
 
-On the RTX 5090 machine, run:
+Keep the [official Ψ₀ checkout](https://github.com/physical-superintelligence-lab/Psi0) beside this project. In [baseline_config.json](baseline_config.json), set `psi_repo` to its absolute path. The dataset path is relative to that checkout. All baseline settings live in that JSON file; the checkpoint step and published dataset revision are fixed in the scripts.
+
+On the RTX 5090 machine:
 
 ```bash
 cd /path/to/qpsi
-nvidia-smi
 uv sync --python 3.11
-./.venv/bin/python -c 'import sys, torch; print("Python:", sys.executable); print("PyTorch:", torch.__version__, torch.__file__); print("CUDA:", torch.version.cuda); print("GPU:", torch.cuda.get_device_name(0)); print("architectures:", torch.cuda.get_arch_list()); print("CUDA kernel:", torch.zeros(1, device="cuda"))'
-```
-
-`uv sync` reads this project's [pyproject.toml](pyproject.toml), creates or updates `qpsi/.venv`, and records resolved dependencies in `qpsi/uv.lock`. The project file pins direct inference dependencies and directs Torch and torchvision to the CUDA 12.8 wheel index. No activation is needed. The next command prints the interpreter, wheel, CUDA version, GPU, and supported architectures, then actually runs `torch.zeros` on CUDA. Stop here if that check fails; the checkpoint is not needed to diagnose a Torch kernel error. The Ψ₀ source selects PyTorch SDPA when `flash-attn` is absent, so this first environment does not compile `flash-attn`.
-
-The [Ψ₀ troubleshooting guide](https://github.com/physical-superintelligence-lab/Psi0#troubleshootings) recommends CUDA 12.8 PyTorch for `sm_120`; [uv supports selecting that backend directly](https://docs.astral.sh/uv/guides/integration/pytorch/). CUDA 12.8 requires a sufficiently recent NVIDIA driver; [NVIDIA lists 570.26 or newer for Linux CUDA 12.8 GA](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-toolkit-release-notes/). If `nvidia-smi` reports an older driver or the CUDA allocation fails despite the `+cu128` wheel, record the full output before changing packages.
-
-## Run the baseline
-
-After the environment check passes:
-
-```bash
-cd /path/to/qpsi
+./.venv/bin/python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0), torch.cuda.get_arch_list()); print(torch.zeros(1, device="cuda"))'
 bash baseline_setup.sh
 ./.venv/bin/python baseline.py
 ```
 
-Use `./.venv/bin/python` for later BF16 and FP8 measurements. This avoids accidentally running the Python in `Psi0/.venv` or another activated environment.
+`uv sync` uses this project's [pyproject.toml](pyproject.toml) and CUDA 12.8 Torch wheel source. `baseline_setup.sh` pins the checkpoint to model commit `4c6f9776fc5b18d87945254175e38bb74b9d7748` and the public UniFolM validation archive to data commit `e78fb93cc28912a3031a10b8656d32d7f0a2b867`, then extracts the archive under `Psi0/.data/`. If Hugging Face requests authentication, run `uvx hf auth login` and paste your token into the CLI. The script verifies the archive's SHA256 before evaluation. The checkpoint is about 11 GB; the validation archive is 33.5 MB. Keep sufficient disk space for the checkpoint, uv environment, and model caches.
 
-`baseline_setup.sh` downloads the selected [SONIC checkpoint](https://huggingface.co/USC-PSI-Lab/psi-model/tree/main/psi0/sonic-checkpoints/multi-task.psi-dream.2609092156) into `Psi0/cache/checkpoints/`. The download uses `uvx --from huggingface_hub hf download` and is about 11 GB. The release includes the combined model weights, Ψ₀ configuration, and cached CLIP instruction embeddings. No training run or local dataset is needed for this first reference. `baseline.py` only loads the checkpoint and measures BF16 inference.
+The first run may download `openai/clip-vit-large-patch14` to compute frozen CLIP projections for UniFolM instructions absent from the checkpoint's cache. The run saves the exact projections used, so later precision variants can reuse them.
 
-The script prints model parameter counts by dtype, warms inference once, then writes these files into `baseline_results/` beside the script:
+## What the script measures
 
-- `actions.jsonl`: one normalized action chunk per sampling seed.
-- `summary.json`: checkpoint identity, exact synthetic input, seeds, action shape, mean latency, throughput, and peak CUDA memory.
+It selects `samples` full 30-step windows, distributing them as evenly as possible across the nine episodes and spacing frames evenly within each episode. For each selected frame it uses the recorded egocentric image, 43-value state, and lowercased instruction. It applies the checkpoint's saved image resize/crop and **checkpoint normalization bounds**; it pads the state to 45. The recorded action target is ordered as body token 64, hands 14, then two neutral neck inputs. The neck values are excluded from loss. No validation augmentation or random state jitter is applied.
 
-The input is a constant gray 480×270 image, zero state vector, and one instruction from the released CLIP cache. This gives reproducible BF16 action outputs for an initial FP8 error measurement. For accuracy on real tasks or validation flow loss, a representative SONIC dataset and a separate evaluation path are still required.
+For output fidelity, the script seeds each example with `seed + sample_id`, runs ten inference steps by default, and saves the complete normalized 30×80 predicted action chunk. For quality, it samples one fixed Gaussian noise tensor and flow timestep per example, computes the checkpoint's velocity target `noise − normalized_action`, and evaluates mean squared velocity error on the shared 78 dimensions. It reports body and hand loss separately. The saved noise, timesteps, frame IDs, and CLIP vectors make the next variant's evaluation paired with this reference.
 
-## Read the results
+The result is **flow matching loss on UniFolM observations**. It is not action MSE against a single demonstrated trajectory, and its absolute value is not the checkpoint's original fine-tuning validation score. Compare an FP8 variant by the change in this loss under the same saved inputs, noise, and timesteps. Also compare its full 80-value predicted actions against this reference using MAE, MSE, cosine similarity, and per-dimension error. Compare latency and peak allocated VRAM only on the same GPU and software environment.
 
-`summary.json` contains the values to place alongside each FP8 run:
+## Saved files
 
-| Value | Meaning |
+Everything is written to `baseline_results/` next to `baseline.py`:
+
+| File | Contents |
 | --- | --- |
-| `parameter_counts_by_dtype` | Actual stored parameter types in the VLM and action expert. “BF16 reference” describes the official unquantized inference path; some parameters may be FP32. |
-| `mean_latency_seconds` | Mean time for one action chunk after a warmup call. With five samples this is a quick estimate. |
-| `throughput_samples_per_second` | Number of action chunks per second, computed from the measured call times. |
-| `peak_vram_bytes` | Peak PyTorch CUDA allocation during the measured calls, including loaded model weights. |
-| `action_shape` | Expected shape of each saved action chunk. |
+| `summary.json` | Checkpoint and dataset identity, parameter dtypes, shared-action flow loss, per-episode loss, timing, throughput, peak inference allocation, and software/GPU information. |
+| `actions.jsonl` | One normalized 30×80 action chunk per selected frame, with episode/frame ID and inference seed. |
+| `flow_losses.jsonl` | Shared 78-value, body 64-value, and hand 14-value velocity MSE for each selected frame. |
+| `flow_noise.npy`, `flow_sigmas.npy` | Fixed noise and flow timesteps for the paired quantized run. |
+| `pooled_projections.pt` | Exact frozen CLIP instruction vectors used by this run. |
 
-`actions.jsonl` contains one record per seed. To compare an FP8 run, pair records by `sample_id` and `seed`, then calculate action MAE, MSE, and cosine similarity between FP8 and BF16 arrays. Compare latency and peak VRAM on the same GPU with the same `samples`, `seed`, `inference_steps`, image, state, and instruction. Lower action error means the quantized output stayed closer to this reference; lower latency or VRAM means a resource improvement.
-
-This first run answers whether the released checkpoint loads, what dtypes it actually uses, and how FP8 changes its outputs and resource use on one fixed input. Five draws of that input are a smoke measurement. They do not establish model accuracy, validation loss, episode reward, or representative performance across tasks; those require real SONIC observations and a separate evaluation set.
+The `samples` default is 100, or roughly 11 windows per episode. Windows from one episode are correlated; per-episode means in the summary help reveal when one scene dominates a change. This is an offline numerical comparison. A robot or simulation evaluation would be needed to measure task success.
 
 ## Config fields
 
-| Field | Use |
+| Field | Meaning |
 | --- | --- |
-| `psi_repo` | Local Ψ₀ checkout. Edit this first. |
-| `checkpoint` | Released SONIC checkpoint; keep fixed across BF16 and FP8. The script uses its step 40000. |
-| `seed` / `samples` | Initial seed and number of repeatable sampling runs. |
-| `inference_steps` | Flow sampling steps passed to Ψ₀'s `predict_action()`. |
+| `psi_repo` | Absolute path to the Ψ₀ checkout. |
+| `checkpoint` | Released SONIC checkpoint, held fixed across all precision variants. |
+| `validation_dataset` | Extracted UniFolM validation directory, relative to `psi_repo` or absolute. |
+| `seed` | Base seed for paired inference and saved flow noise. |
+| `samples` | Number of fixed validation frames with complete 30-step action windows. |
+| `inference_steps` | Euler flow sampling steps for action generation; separate from the single-step flow loss. |
