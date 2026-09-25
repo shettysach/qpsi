@@ -56,7 +56,7 @@ def quantize_linears(module: nn.Module) -> dict:
     )
 
     selected = {
-        name: layer.in_features * layer.out_features
+        name: layer
         for name, layer in module.named_modules()
         if isinstance(layer, nn.Linear)
         and name != "lm_head"  # VLM embedding/output weights may be tied.
@@ -66,6 +66,14 @@ def quantize_linears(module: nn.Module) -> dict:
     }
     if not selected:
         raise ValueError("No FP8 eligible linear layers found")
+    weight_parameters = sum(layer.weight.numel() for layer in selected.values())
+    bf16_biases = []
+    for name, layer in selected.items():
+        if layer.bias is not None and layer.bias.dtype == torch.float32:
+            bias = layer.bias
+            layer.bias = nn.Parameter(bias.detach().to(torch.bfloat16),
+                                      requires_grad=bias.requires_grad)
+            bf16_biases.append(name)
     config = Float8DynamicActivationFloat8WeightConfig(
         activation_dtype=torch.float8_e4m3fn,
         weight_dtype=torch.float8_e4m3fn,
@@ -76,7 +84,8 @@ def quantize_linears(module: nn.Module) -> dict:
     return {"scheme": "torchao dynamic W8A8 FP8 E4M3 per tensor",
             "torchao_version": package_version("torchao"),
             "linear_layers": sorted(selected),
-            "weight_parameters": sum(selected.values())}
+            "weight_parameters": weight_parameters,
+            "bf16_bias_layers": bf16_biases}
 
 
 def file_hash(path: Path) -> str:
