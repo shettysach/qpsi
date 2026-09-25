@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Save repeatable BF16 outputs from the released Ψ₀ + SONIC checkpoint.
 
-Edit baseline_config.json, activate the official Psi0 environment, then run:
-    python /path/to/qpsi/baseline.py
+Edit baseline_config.json, create the uv baseline environment, then run:
+    /path/to/qpsi/.venv/bin/python /path/to/qpsi/baseline.py
 """
 
 from __future__ import annotations
 
 import json
 import random
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -35,6 +36,9 @@ def main() -> None:
     repo = Path(settings["psi_repo"]).expanduser().resolve()
     if not (repo / "src" / "psi" / "models" / "psi0.py").is_file():
         raise FileNotFoundError(f"Set psi_repo in {CONFIG_FILE} to the official Psi0 checkout")
+    # Use the configured checkout directly; the baseline environment contains
+    # its inference dependencies, without installing the full training project.
+    sys.path.insert(0, str(repo / "src"))
 
     checkpoint_id = settings["checkpoint"]
     cache_dir = repo / "cache" / "checkpoints"
@@ -60,6 +64,16 @@ def main() -> None:
         raise ValueError(f"Checkpoint contains a pointer or incomplete weights: {checkpoint_file}")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this baseline")
+    capability = torch.cuda.get_device_capability(0)
+    architecture = f"sm_{capability[0]}{capability[1]}"
+    supported = torch.cuda.get_arch_list()
+    if architecture not in supported:
+        raise RuntimeError(
+            f"This PyTorch wheel does not support {architecture} "
+            f"({torch.cuda.get_device_name(0)}). Installed wheel: {torch.__version__}, "
+            f"CUDA {torch.version.cuda}; supported architectures: {supported}. "
+            "Recreate the uv baseline environment with baseline_env.sh."
+        )
 
     from psi.models.psi0 import Psi0Model
     from psi.utils import apply_legacy_model_config_defaults, parse_args_to_tyro_config
