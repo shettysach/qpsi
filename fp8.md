@@ -14,4 +14,6 @@ Quantize eligible large linear layers with W8A8 FP8 E4M3. Keep normalization, so
 
 Run `baseline.py` first on the pinned UniFolM validation pack and retain `baseline_results/`. Keep the released BF16-VLM/FP32-expert configuration as the reference. Treat a BF16 action expert as a separate precision variant when comparing FP32, BF16, and FP8 in that component.
 
+For the BF16 action expert, change only `action_head_dtype` in `baseline_config.json` to `bf16` and rerun `baseline.py`. The script stores its paired results in `bf16_action_head_results/`.
+
 Add task success or episode reward when an evaluation environment is available.

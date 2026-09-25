@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Save the unquantized Ψ₀/SONIC reference on fixed UniFolM validation frames.
+"""Save the released or BF16-action-head Ψ₀/SONIC validation run.
 
 All user settings are in baseline_config.json. The public pack has body and hand
 targets, but no neck targets, so flow loss is measured on the shared 78 values.
@@ -23,7 +23,8 @@ import torch
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = ROOT / "baseline_config.json"
-RESULTS = ROOT / "baseline_results"
+REFERENCE_RESULTS = ROOT / "baseline_results"
+BF16_RESULTS = ROOT / "bf16_action_head_results"
 STEP = 40000
 CHECKPOINT_REVISION = "4c6f9776fc5b18d87945254175e38bb74b9d7748"
 DATA_REVISION = "e78fb93cc28912a3031a10b8656d32d7f0a2b867"
@@ -169,8 +170,51 @@ def evaluate_flow(model, image, state, instruction, projection, target, sigma, n
     return [float(squared[:, a:b].mean().item()) for a, b in ((0, 78), (0, 64), (64, 78))]
 
 
+def read_jsonl(path: Path) -> list[dict]:
+    with path.open(encoding="utf-8") as stream:
+        return [json.loads(line) for line in stream if line.strip()]
+
+
+def compare_with_reference(actions: list[dict], losses: list[dict], summary: dict) -> dict:
+    reference_actions = read_jsonl(REFERENCE_RESULTS / "actions.jsonl")
+    reference_losses = read_jsonl(REFERENCE_RESULTS / "flow_losses.jsonl")
+    if len(actions) != len(reference_actions) or len(losses) != len(reference_losses):
+        raise ValueError("Reference and BF16 runs have different sample counts")
+    absolute_errors, squared_errors, cosines = [], [], []
+    for current, original, current_loss, original_loss in zip(
+        actions, reference_actions, losses, reference_losses
+    ):
+        keys = ("sample_id", "seed", "episode_index", "frame_index", "instruction")
+        if any(current[key] != original[key] for key in keys):
+            raise ValueError("BF16 action sample does not match the unquantized reference")
+        if any(current_loss[key] != original_loss[key] for key in ("sample_id", "episode_index", "frame_index")):
+            raise ValueError("BF16 flow sample does not match the unquantized reference")
+        new = np.asarray(current["action"], dtype=np.float32)
+        old = np.asarray(original["action"], dtype=np.float32)
+        if new.shape != (30, 80) or old.shape != (30, 80):
+            raise ValueError("Paired action shapes differ from 30×80")
+        error = new - old
+        absolute_errors.append(float(np.abs(error).mean()))
+        squared_errors.append(float(np.square(error).mean()))
+        denominator = float(np.linalg.norm(new) * np.linalg.norm(old))
+        cosines.append(float(np.sum(new * old) / denominator) if denominator else 1.0 if np.array_equal(new, old) else 0.0)
+    reference_summary = json.loads((REFERENCE_RESULTS / "summary.json").read_text())
+    return {
+        "action_mae": float(np.mean(absolute_errors)),
+        "action_mse": float(np.mean(squared_errors)),
+        "mean_action_cosine_similarity": float(np.mean(cosines)),
+        "flow_loss_shared78_delta": summary["flow_loss_shared78_mse"] - reference_summary["flow_loss_shared78_mse"],
+        "mean_latency_seconds_delta": summary["mean_latency_seconds"] - reference_summary["mean_latency_seconds"],
+        "peak_inference_vram_bytes_delta": summary["peak_inference_vram_bytes"] - reference_summary["peak_inference_vram_bytes"],
+    }
+
+
 def main() -> None:
     settings = json.loads(CONFIG.read_text())
+    action_head_dtype = settings.get("action_head_dtype", "fp32")
+    if action_head_dtype not in ("fp32", "bf16"):
+        raise ValueError("action_head_dtype must be fp32 or bf16")
+    results = REFERENCE_RESULTS if action_head_dtype == "fp32" else BF16_RESULTS
     repo = Path(settings["psi_repo"]).expanduser().resolve()
     dataset = Path(settings["validation_dataset"]).expanduser()
     dataset = (dataset if dataset.is_absolute() else repo / dataset).resolve()
@@ -216,8 +260,38 @@ def main() -> None:
     torch.cuda.manual_seed_all(seed)
     examples = load_examples(dataset, samples, 30)
     device = "cuda:0"
+    if action_head_dtype == "bf16":
+        reference = json.loads((REFERENCE_RESULTS / "summary.json").read_text())
+        expected = {
+            "checkpoint": settings["checkpoint"], "checkpoint_step": STEP,
+            "checkpoint_revision": CHECKPOINT_REVISION,
+            "dataset_revision": DATA_REVISION, "dataset_sha256": DATA_SHA256,
+            "samples": samples, "seed": seed, "inference_steps": steps,
+            "torch_version": torch.__version__, "torch_cuda_version": torch.version.cuda,
+            "cuda_device": torch.cuda.get_device_name(device),
+        }
+        for key, value in expected.items():
+            if reference.get(key) != value:
+                raise ValueError(f"Reference {key} differs from this run; rerun the fp32 reference first")
+        reference_rows = read_jsonl(REFERENCE_RESULTS / "actions.jsonl")
+        if len(reference_rows) != len(examples):
+            raise ValueError("Reference action count differs from selected examples")
+        for index, (original, row) in enumerate(zip(reference_rows, examples)):
+            if (original["sample_id"], original["seed"], original["episode_index"],
+                original["frame_index"], original["instruction"]) != (
+                index, seed + index, row["episode_index"], row["frame_index"], row["instruction"]
+            ):
+                raise ValueError(f"Reference sample {index} differs from selected validation frame")
     model = Psi0Model.from_pretrained(checkpoint, STEP, launch, device=device).to(device).eval()
-    vectors = get_projections([row["instruction"] for row in examples], checkpoint, launch.model, device)
+    if action_head_dtype == "bf16":
+        model.action_header.to(dtype=torch.bfloat16)
+        if any(parameter.dtype != torch.bfloat16 for parameter in model.action_header.parameters()):
+            raise ValueError("Action head contains weights that were not cast to BF16")
+        vectors = torch.load(REFERENCE_RESULTS / "pooled_projections.pt", map_location="cpu", weights_only=True)
+        if not isinstance(vectors, dict) or set(row["instruction"] for row in examples) != set(vectors):
+            raise ValueError("Reference CLIP projections do not match the selected validation examples")
+    else:
+        vectors = get_projections([row["instruction"] for row in examples], checkpoint, launch.model, device)
     resize = launch.data.transform.model.resize()
     crop = launch.data.transform.model.center_crop()
     for row in examples:
@@ -225,13 +299,19 @@ def main() -> None:
         padded = np.pad(row["state"], (0, 2))
         row["state"] = torch.from_numpy(field.normalize_state_func(padded)).reshape(1, 1, 45).to(device)
         row["target"] = normalize_actions(row["actions"], field)
-    RESULTS.mkdir(parents=True, exist_ok=True)
-    torch.save(vectors, RESULTS / "pooled_projections.pt")
-    rng = torch.Generator(device="cpu").manual_seed(seed)
-    sigmas = torch.rand(samples, generator=rng).numpy().astype(np.float32)
-    noise = torch.randn((samples, 30, 80), generator=rng).numpy().astype(np.float32)
-    np.save(RESULTS / "flow_sigmas.npy", sigmas)
-    np.save(RESULTS / "flow_noise.npy", noise)
+    results.mkdir(parents=True, exist_ok=True)
+    torch.save(vectors, results / "pooled_projections.pt")
+    if action_head_dtype == "bf16":
+        sigmas = np.load(REFERENCE_RESULTS / "flow_sigmas.npy", allow_pickle=False)
+        noise = np.load(REFERENCE_RESULTS / "flow_noise.npy", allow_pickle=False)
+        if sigmas.shape != (samples,) or noise.shape != (samples, 30, 80):
+            raise ValueError("Reference flow noise or timesteps have the wrong shape")
+    else:
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        sigmas = torch.rand(samples, generator=rng).numpy().astype(np.float32)
+        noise = torch.randn((samples, 30, 80), generator=rng).numpy().astype(np.float32)
+    np.save(results / "flow_sigmas.npy", sigmas)
+    np.save(results / "flow_noise.npy", noise)
 
     def predict(row):
         projection = vectors[row["instruction"]].unsqueeze(0).to(device)
@@ -279,11 +359,13 @@ def main() -> None:
         print(f"Flow loss {index + 1}/{samples}: {shared:.5f}", flush=True)
 
     for name, rows in (("actions.jsonl", actions), ("flow_losses.jsonl", losses)):
-        with (RESULTS / name).open("w", encoding="utf-8") as stream:
+        with (results / name).open("w", encoding="utf-8") as stream:
             for row in rows:
                 stream.write(json.dumps(row) + "\n")
     summary = {
-        "reference": "unquantized_psi0_sonic",
+        "variant": "released_fp32_action_head" if action_head_dtype == "fp32" else "bf16_action_head",
+        "reference": "unquantized_psi0_sonic" if action_head_dtype == "fp32" else "baseline_results",
+        "action_head_dtype": action_head_dtype,
         "checkpoint": settings["checkpoint"], "checkpoint_step": STEP,
         "checkpoint_revision": CHECKPOINT_REVISION,
         "dataset": "USC-PSI-Lab/psi-data/sonic/unifolm_sonic_lerobot_val.zip",
@@ -314,8 +396,10 @@ def main() -> None:
         "peak_inference_vram_bytes": inference_peak,
         "actions_file": "actions.jsonl", "flow_losses_file": "flow_losses.jsonl",
     }
-    (RESULTS / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    print(f"Saved unquantized validation reference in {RESULTS}")
+    if action_head_dtype == "bf16":
+        summary["comparison_to_unquantized"] = compare_with_reference(actions, losses, summary)
+    (results / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    print(f"Saved {summary['variant']} validation results in {results}")
 
 
 if __name__ == "__main__":

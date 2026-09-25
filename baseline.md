@@ -44,6 +44,18 @@ Everything is written to `baseline_results/` next to `baseline.py`:
 
 The `samples` default is 100, or roughly 11 windows per episode. Windows from one episode are correlated; per-episode means in the summary help reveal when one scene dominates a change. This is an offline numerical comparison. A robot or simulation evaluation would be needed to measure task success.
 
+## Run the BF16 action head variant
+
+After `baseline_results/` exists, change only `action_head_dtype` in `baseline_config.json` from `"fp32"` to `"bf16"`, then run:
+
+```bash
+./.venv/bin/python baseline.py
+```
+
+The script loads the same released checkpoint and casts `model.action_header` to BF16 **after loading**. The VLM stays as released. This changes the head's stored weights; the released run already used BF16 autocast for inference. The BF16 run saves its own outputs in `bf16_action_head_results/` and does not overwrite `baseline_results/`.
+
+The BF16 run reads the reference's saved CLIP projections, Gaussian noise, and timesteps. It checks the checkpoint, dataset, sample count, seed, inference steps, PyTorch/CUDA versions, and GPU before starting. Its `summary.json` includes `comparison_to_unquantized`: paired action MAE/MSE/cosine similarity, change in shared-78 flow loss, change in mean latency, and change in peak allocated VRAM. A positive flow-loss change means the BF16 head has greater velocity-prediction error on this set.
+
 ## Config fields
 
 | Field | Meaning |
@@ -51,6 +63,7 @@ The `samples` default is 100, or roughly 11 windows per episode. Windows from on
 | `psi_repo` | Absolute path to the Ψ₀ checkout. |
 | `checkpoint` | Released SONIC checkpoint, held fixed across all precision variants. |
 | `validation_dataset` | Extracted UniFolM validation directory, relative to `psi_repo` or absolute. |
+| `action_head_dtype` | `fp32` for the released reference; `bf16` for the isolated BF16 action head variant. |
 | `seed` | Base seed for paired inference and saved flow noise. |
 | `samples` | Number of fixed validation frames with complete 30-step action windows. |
 | `inference_steps` | Euler flow sampling steps for action generation; separate from the single-step flow loss. |
