@@ -17,6 +17,7 @@ dependencies = [
     "einops==0.8.1",
     "av==15.0.0",
     "pyarrow==20.0.0",
+    "matplotlib==3.10.6",
 ]
 
 [tool.uv]

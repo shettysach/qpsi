@@ -56,6 +56,19 @@ The script loads the same released checkpoint and casts `model.action_header` to
 
 The BF16 run reads the reference's saved CLIP projections, Gaussian noise, and timesteps. It checks the checkpoint, dataset, sample count, seed, inference steps, PyTorch/CUDA versions, and GPU before starting. Its `summary.json` includes `comparison_to_unquantized`: paired action MAE/MSE/cosine similarity, change in shared-78 flow loss, change in mean latency, and change in peak allocated VRAM. A positive flow-loss change means the BF16 head has greater velocity-prediction error on this set.
 
+## View the comparison
+
+Once both result folders exist, install the plotting dependency through the same project environment and generate the figure:
+
+```bash
+uv sync --python 3.11
+./.venv/bin/python compare_results.py
+```
+
+Open `comparison_results/comparison.png`. The top row shows paired flow loss for every frame, mean flow-loss change by episode, and action-output MAE for each of the 80 dimensions. In the scatter plot, points above the diagonal mean BF16 had higher loss on that frame. The bottom row compares mean flow loss, mean action-chunk latency, and peak inference GPU allocation. The script also writes `comparison.json` with exact numbers and `per_sample.csv` for deeper analysis; it checks that the two runs used the same checkpoint, dataset, samples, GPU, noise, and timesteps.
+
+For a quick text view without plotting, run `jq '.comparison_to_unquantized' bf16_action_head_results/summary.json`. Lower flow loss is better on this offline set; lower action MAE means the BF16 head stayed closer to the released output. A small action MAE alone does not establish task success. Latency differences should be read alongside the GPU and software details in both summaries.
+
 ## Config fields
 
 | Field | Meaning |
