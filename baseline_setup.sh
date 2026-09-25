@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="$SCRIPT_DIR/baseline_config.json"
-
-PSI_REPO="$(jq -r '.psi_repo' "$CONFIG_FILE")"
-CHECKPOINT="$(jq -r '.checkpoint' "$CONFIG_FILE")"
+PSI_REPO="/home/sach/Desktop/Psi0"
+CHECKPOINT="psi0/sonic-checkpoints/multi-task.psi-dream.2609092156"
 HF_REPO="USC-PSI-Lab/psi-model"
 CHECKPOINT_REVISION="4c6f9776fc5b18d87945254175e38bb74b9d7748"
 CHECKPOINT_CACHE="$PSI_REPO/cache/checkpoints"
@@ -13,7 +10,7 @@ DATASET_ROOT="$PSI_REPO/.data"
 DATASET_REVISION="e78fb93cc28912a3031a10b8656d32d7f0a2b867"
 
 if [[ ! -f "$PSI_REPO/src/psi/models/psi0.py" ]]; then
-  echo "Set psi_repo in $CONFIG_FILE to the official Psi0 checkout." >&2
+  echo "Psi0 checkout missing at $PSI_REPO" >&2
   exit 1
 fi
 

@@ -1,35 +1,75 @@
 #!/usr/bin/env python3
-"""Save the released or BF16-action-head Ψ₀/SONIC validation run.
+"""Evaluate Ψ₀/SONIC on fixed UniFolM frames and save paired measurements.
 
-All user settings are in baseline_config.json. The public pack has body and hand
-targets, but no neck targets, so flow loss is measured on the shared 78 values.
+The public pack has body and hand targets but no neck targets. Flow loss covers
+the shared 78 action values; generated-action comparisons cover all 80 values.
 """
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import random
 import sys
 import time
 from collections import Counter
+from importlib.metadata import version as package_version
 from pathlib import Path
 
 import av
 import numpy as np
 import pyarrow.parquet as pq
 import torch
+from torch import nn
 
 
 ROOT = Path(__file__).resolve().parent
-CONFIG = ROOT / "baseline_config.json"
-REFERENCE_RESULTS = ROOT / "baseline_results"
-BF16_RESULTS = ROOT / "bf16_action_head_results"
-STEP = 40000
+PSI_REPO = Path("/home/sach/Desktop/Psi0")
+CHECKPOINT = "psi0/sonic-checkpoints/multi-task.psi-dream.2609092156"
+VALIDATION_DATASET = Path(".data/unifolm_sonic_lerobot_val")
+SEED = 0
+SAMPLES = 100
+INFERENCE_STEPS = 10
+RESULTS_ROOT = ROOT / "results"
+REFERENCE_RESULTS = RESULTS_ROOT / "vlm_bf16_act_fp32"
+CHECKPOINT_STEP = 40000
 CHECKPOINT_REVISION = "4c6f9776fc5b18d87945254175e38bb74b9d7748"
 DATA_REVISION = "e78fb93cc28912a3031a10b8656d32d7f0a2b867"
 DATA_SHA256 = "3d264d6454d59e83be5dadaa17f122b732a8c6cb86a2429c33c1f4fc912fc4b7"
 IMAGE_KEY = "observation.images.egocentric"
+
+
+def arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate a Ψ₀ precision variant on fixed SONIC data.")
+    parser.add_argument("--vlm", choices=("bf16", "fp8"), required=True,
+                        help="VLM weights: released BF16 or FP8 eligible linear layers")
+    parser.add_argument("--act", choices=("fp32", "bf16", "fp8"), required=True,
+                        help="Action expert weights: released FP32, BF16, or FP8 eligible linear layers")
+    return parser.parse_args()
+
+
+def quantize_linears(module: nn.Module) -> dict:
+    """Apply real W8A8 E4M3 FP8 to supported linears; leave other layers alone."""
+    from torchao.quantization import Float8DynamicActivationFloat8WeightConfig, quantize_
+
+    selected = {
+        name: layer.in_features * layer.out_features
+        for name, layer in module.named_modules()
+        if isinstance(layer, nn.Linear)
+        and name != "lm_head"  # VLM embedding/output weights may be tied.
+        and layer.in_features % 16 == 0
+        and layer.out_features % 16 == 0
+        and min(layer.in_features, layer.out_features) >= 64
+    }
+    if not selected:
+        raise ValueError("No FP8 eligible linear layers found")
+    quantize_(module, Float8DynamicActivationFloat8WeightConfig(),
+              filter_fn=lambda layer, name: name in selected and isinstance(layer, nn.Linear))
+    return {"scheme": "torchao dynamic W8A8 FP8 E4M3 per tensor",
+            "torchao_version": package_version("torchao"),
+            "linear_layers": sorted(selected),
+            "weight_parameters": sum(selected.values())}
 
 
 def file_hash(path: Path) -> str:
@@ -175,58 +215,26 @@ def read_jsonl(path: Path) -> list[dict]:
         return [json.loads(line) for line in stream if line.strip()]
 
 
-def compare_with_reference(actions: list[dict], losses: list[dict], summary: dict) -> dict:
-    reference_actions = read_jsonl(REFERENCE_RESULTS / "actions.jsonl")
-    reference_losses = read_jsonl(REFERENCE_RESULTS / "flow_losses.jsonl")
-    if len(actions) != len(reference_actions) or len(losses) != len(reference_losses):
-        raise ValueError("Reference and BF16 runs have different sample counts")
-    absolute_errors, squared_errors, cosines = [], [], []
-    for current, original, current_loss, original_loss in zip(
-        actions, reference_actions, losses, reference_losses
-    ):
-        keys = ("sample_id", "seed", "episode_index", "frame_index", "instruction")
-        if any(current[key] != original[key] for key in keys):
-            raise ValueError("BF16 action sample does not match the unquantized reference")
-        if any(current_loss[key] != original_loss[key] for key in ("sample_id", "episode_index", "frame_index")):
-            raise ValueError("BF16 flow sample does not match the unquantized reference")
-        new = np.asarray(current["action"], dtype=np.float32)
-        old = np.asarray(original["action"], dtype=np.float32)
-        if new.shape != (30, 80) or old.shape != (30, 80):
-            raise ValueError("Paired action shapes differ from 30×80")
-        error = new - old
-        absolute_errors.append(float(np.abs(error).mean()))
-        squared_errors.append(float(np.square(error).mean()))
-        denominator = float(np.linalg.norm(new) * np.linalg.norm(old))
-        cosines.append(float(np.sum(new * old) / denominator) if denominator else 1.0 if np.array_equal(new, old) else 0.0)
-    reference_summary = json.loads((REFERENCE_RESULTS / "summary.json").read_text())
-    return {
-        "action_mae": float(np.mean(absolute_errors)),
-        "action_mse": float(np.mean(squared_errors)),
-        "mean_action_cosine_similarity": float(np.mean(cosines)),
-        "flow_loss_shared78_delta": summary["flow_loss_shared78_mse"] - reference_summary["flow_loss_shared78_mse"],
-        "mean_latency_seconds_delta": summary["mean_latency_seconds"] - reference_summary["mean_latency_seconds"],
-        "peak_inference_vram_bytes_delta": summary["peak_inference_vram_bytes"] - reference_summary["peak_inference_vram_bytes"],
-    }
-
-
 def main() -> None:
-    settings = json.loads(CONFIG.read_text())
-    action_head_dtype = settings.get("action_head_dtype", "fp32")
-    if action_head_dtype not in ("fp32", "bf16"):
-        raise ValueError("action_head_dtype must be fp32 or bf16")
-    results = REFERENCE_RESULTS if action_head_dtype == "fp32" else BF16_RESULTS
-    repo = Path(settings["psi_repo"]).expanduser().resolve()
-    dataset = Path(settings["validation_dataset"]).expanduser()
+    args = arguments()
+    vlm_dtype, act_dtype = args.vlm, args.act
+    variant = f"vlm_{vlm_dtype}_act_{act_dtype}"
+    results = RESULTS_ROOT / variant
+    is_reference = results == REFERENCE_RESULTS
+    if results.exists() and any(results.iterdir()):
+        raise FileExistsError(f"Results already exist: {results}; move them before rerunning")
+    repo = PSI_REPO.expanduser().resolve()
+    dataset = VALIDATION_DATASET.expanduser()
     dataset = (dataset if dataset.is_absolute() else repo / dataset).resolve()
     if not (repo / "src/psi/models/psi0.py").is_file():
-        raise FileNotFoundError(f"Set psi_repo in {CONFIG} to the official Psi0 checkout")
+        raise FileNotFoundError(f"Ψ₀ checkout missing: {repo}")
     if not (dataset / "meta/info.json").is_file():
         raise FileNotFoundError(f"Validation dataset missing at {dataset}; run baseline_setup.sh")
     archive = dataset.parent / "sonic/unifolm_sonic_lerobot_val.zip"
     if not archive.is_file() or file_hash(archive) != DATA_SHA256:
         raise ValueError(f"Expected pinned validation archive at {archive}, SHA256 {DATA_SHA256}")
-    checkpoint = repo / "cache/checkpoints" / settings["checkpoint"]
-    weights = checkpoint / f"checkpoints/ckpt_{STEP}/model.safetensors"
+    checkpoint = repo / "cache/checkpoints" / CHECKPOINT
+    weights = checkpoint / f"checkpoints/ckpt_{CHECKPOINT_STEP}/model.safetensors"
     for path in (weights, checkpoint / "argv.txt", checkpoint / "run_config.json", checkpoint / "clip_pooled_cache.pt"):
         if not path.is_file():
             raise FileNotFoundError(f"Checkpoint file missing: {path}; run baseline_setup.sh")
@@ -251,7 +259,7 @@ def main() -> None:
     field = launch.data.transform.field
     if not field.normalize_state or field.state_min is None or field.action_min is None:
         raise ValueError("Checkpoint run_config lacks embedded normalization statistics")
-    seed, samples, steps = (int(settings[key]) for key in ("seed", "samples", "inference_steps"))
+    seed, samples, steps = SEED, SAMPLES, INFERENCE_STEPS
     if samples < 1 or steps < 1:
         raise ValueError("samples and inference_steps must be positive")
     random.seed(seed)
@@ -260,10 +268,13 @@ def main() -> None:
     torch.cuda.manual_seed_all(seed)
     examples = load_examples(dataset, samples, 30)
     device = "cuda:0"
-    if action_head_dtype == "bf16":
+    if not is_reference:
         reference = json.loads((REFERENCE_RESULTS / "summary.json").read_text())
+        if (reference.get("vlm_dtype", "bf16"),
+            reference.get("action_expert_dtype", reference.get("action_head_dtype", "fp32"))) != ("bf16", "fp32"):
+            raise ValueError(f"{REFERENCE_RESULTS} is not the released reference")
         expected = {
-            "checkpoint": settings["checkpoint"], "checkpoint_step": STEP,
+            "checkpoint": CHECKPOINT, "checkpoint_step": CHECKPOINT_STEP,
             "checkpoint_revision": CHECKPOINT_REVISION,
             "dataset_revision": DATA_REVISION, "dataset_sha256": DATA_SHA256,
             "samples": samples, "seed": seed, "inference_steps": steps,
@@ -272,7 +283,7 @@ def main() -> None:
         }
         for key, value in expected.items():
             if reference.get(key) != value:
-                raise ValueError(f"Reference {key} differs from this run; rerun the fp32 reference first")
+                raise ValueError(f"Reference {key} differs from this run; rerun the released reference first")
         reference_rows = read_jsonl(REFERENCE_RESULTS / "actions.jsonl")
         if len(reference_rows) != len(examples):
             raise ValueError("Reference action count differs from selected examples")
@@ -282,11 +293,17 @@ def main() -> None:
                 index, seed + index, row["episode_index"], row["frame_index"], row["instruction"]
             ):
                 raise ValueError(f"Reference sample {index} differs from selected validation frame")
-    model = Psi0Model.from_pretrained(checkpoint, STEP, launch, device=device).to(device).eval()
-    if action_head_dtype == "bf16":
+    model = Psi0Model.from_pretrained(checkpoint, CHECKPOINT_STEP, launch, device=device).to(device).eval()
+    if act_dtype == "bf16":
         model.action_header.to(dtype=torch.bfloat16)
         if any(parameter.dtype != torch.bfloat16 for parameter in model.action_header.parameters()):
             raise ValueError("Action head contains weights that were not cast to BF16")
+    fp8_layers = {}
+    if vlm_dtype == "fp8":
+        fp8_layers["vlm"] = quantize_linears(model.vlm_model)
+    if act_dtype == "fp8":
+        fp8_layers["action_expert"] = quantize_linears(model.action_header)
+    if not is_reference:
         vectors = torch.load(REFERENCE_RESULTS / "pooled_projections.pt", map_location="cpu", weights_only=True)
         if not isinstance(vectors, dict) or set(row["instruction"] for row in examples) != set(vectors):
             raise ValueError("Reference CLIP projections do not match the selected validation examples")
@@ -301,7 +318,7 @@ def main() -> None:
         row["target"] = normalize_actions(row["actions"], field)
     results.mkdir(parents=True, exist_ok=True)
     torch.save(vectors, results / "pooled_projections.pt")
-    if action_head_dtype == "bf16":
+    if not is_reference:
         sigmas = np.load(REFERENCE_RESULTS / "flow_sigmas.npy", allow_pickle=False)
         noise = np.load(REFERENCE_RESULTS / "flow_noise.npy", allow_pickle=False)
         if sigmas.shape != (samples,) or noise.shape != (samples, 30, 80):
@@ -363,10 +380,12 @@ def main() -> None:
             for row in rows:
                 stream.write(json.dumps(row) + "\n")
     summary = {
-        "variant": "released_fp32_action_head" if action_head_dtype == "fp32" else "bf16_action_head",
-        "reference": "unquantized_psi0_sonic" if action_head_dtype == "fp32" else "baseline_results",
-        "action_head_dtype": action_head_dtype,
-        "checkpoint": settings["checkpoint"], "checkpoint_step": STEP,
+        "variant": variant,
+        "reference": None if is_reference else REFERENCE_RESULTS.name,
+        "vlm_dtype": vlm_dtype,
+        "action_expert_dtype": act_dtype,
+        "fp8_quantization": fp8_layers,
+        "checkpoint": CHECKPOINT, "checkpoint_step": CHECKPOINT_STEP,
         "checkpoint_revision": CHECKPOINT_REVISION,
         "dataset": "USC-PSI-Lab/psi-data/sonic/unifolm_sonic_lerobot_val.zip",
         "dataset_revision": DATA_REVISION, "dataset_sha256": DATA_SHA256,
@@ -396,8 +415,6 @@ def main() -> None:
         "peak_inference_vram_bytes": inference_peak,
         "actions_file": "actions.jsonl", "flow_losses_file": "flow_losses.jsonl",
     }
-    if action_head_dtype == "bf16":
-        summary["comparison_to_unquantized"] = compare_with_reference(actions, losses, summary)
     (results / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(f"Saved {summary['variant']} validation results in {results}")
 

@@ -1,19 +1,17 @@
-# Ψ₀ FP8 comparisons
+# Ψ₀ precision experiments
 
-The reference is the released, unquantized Ψ₀ + SONIC checkpoint. Its Qwen3-VL weights are BF16; its action expert weights are FP32. Inference runs under BF16 autocast. Call it the **unquantized reference**, rather than an all-BF16 baseline.
+The released SONIC checkpoint is the reference: its VLM weights are BF16 and its action expert weights are FP32. Inference uses BF16 autocast. The five planned runs are:
 
-## Measures for every precision variant
+| Experiment | VLM | Action expert | Command arguments |
+| --- | --- | --- | --- |
+| Released reference | BF16 | FP32 | `--vlm bf16 --act fp32` |
+| Action expert BF16 | BF16 | BF16 | `--vlm bf16 --act bf16` |
+| Action expert FP8 | BF16 | FP8 | `--vlm bf16 --act fp8` |
+| VLM FP8 | FP8 | FP32 | `--vlm fp8 --act fp32` |
+| Both FP8 | FP8 | FP8 | `--vlm fp8 --act fp8` |
 
-- **Offline quality:** flow matching velocity MSE on the shared 78 body/hand dimensions of the public UniFolM SONIC validation set. Reuse the saved noise, timesteps, frame IDs, CLIP vectors, and checkpoint normalization for every variant. Neck dimensions have no targets and are masked. This is a cross-domain loss measure, not robot task success or the authors' Psi-Dream validation score.
-- **Output fidelity:** action-output MAE, MSE, and cosine similarity against the released configuration, with identical observations, inference steps, and paired random seeds.
-- **Resources:** stored weight dtypes by component, inference latency and throughput, and peak GPU memory. Measure all variants on the same GPU and software environment.
+See [baseline.md](baseline.md) for setup and the three commands: [evaluate.py](evaluate.py) writes a validation run, [compare_results.py](compare_results.py) compares one saved run to the reference, and [plot_results.py](plot_results.py) plots all saved runs.
 
-## First comparison
+`fp8` means TorchAO dynamic W8A8 E4M3 on eligible `nn.Linear` layers, not every tensor in the component. Linear dimensions must be multiples of 16 and at least 64. The VLM's tied output/embedding weight is excluded. Norms, embeddings, nonlinear operations, and unsupported projections retain their released precision. The action output linear layer is included when eligible. Each run's `summary.json` records the exact converted layer names and parameter count.
 
-Quantize eligible large linear layers with W8A8 FP8 E4M3. Keep normalization, softmax, embeddings, and other sensitive operations at their existing precision. Start with the language transformer in FP8, leaving the vision tower at BF16 and the action expert at FP32. Expand to the vision tower, then optionally to the action expert, one change at a time.
-
-Run `baseline.py` first on the pinned UniFolM validation pack and retain `baseline_results/`. Keep the released BF16-VLM/FP32-expert configuration as the reference. Treat a BF16 action expert as a separate precision variant when comparing FP32, BF16, and FP8 in that component.
-
-For the BF16 action expert, change only `action_head_dtype` in `baseline_config.json` to `bf16` and rerun `baseline.py`. The script stores its paired results in `bf16_action_head_results/`.
-
-Add task success or episode reward when an evaluation environment is available.
+Every comparison uses the same selected UniFolM observations, CLIP projections, action seeds, flow noise, and timesteps. Compare shared-78 flow MSE, paired generated-action error, inference latency, and peak allocated VRAM. UniFolM has no neck targets, so its two neck dimensions are excluded from flow loss. These numbers measure offline numerical effects, not robot task success.
