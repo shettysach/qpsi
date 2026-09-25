@@ -72,7 +72,7 @@ def main() -> None:
             f"This PyTorch wheel does not support {architecture} "
             f"({torch.cuda.get_device_name(0)}). Installed wheel: {torch.__version__}, "
             f"CUDA {torch.version.cuda}; supported architectures: {supported}. "
-            "Recreate the uv baseline environment with baseline_env.sh."
+            "Run uv sync from qpsi and check the CUDA wheel as described in baseline.md."
         )
 
     from psi.models.psi0 import Psi0Model

@@ -11,10 +11,11 @@ On the RTX 5090 machine, run:
 ```bash
 cd /path/to/qpsi
 nvidia-smi
-bash baseline_env.sh
+uv sync --python 3.11
+./.venv/bin/python -c 'import sys, torch; print("Python:", sys.executable); print("PyTorch:", torch.__version__, torch.__file__); print("CUDA:", torch.version.cuda); print("GPU:", torch.cuda.get_device_name(0)); print("architectures:", torch.cuda.get_arch_list()); print("CUDA kernel:", torch.zeros(1, device="cuda"))'
 ```
 
-`baseline_env.sh` runs `uv sync` for this project's [pyproject.toml](pyproject.toml). uv creates or updates `qpsi/.venv` with Python 3.11 and records resolved dependencies in `qpsi/uv.lock`. The project file pins direct inference dependencies and directs Torch and torchvision to the CUDA 12.8 wheel index. No activation is needed. The script prints the Python and PyTorch locations, CUDA version, GPU architecture, and supported architectures, then actually runs `torch.zeros` on CUDA. Stop here if that check fails; the checkpoint is not needed to diagnose a Torch kernel error. The Ψ₀ source selects PyTorch SDPA when `flash-attn` is absent, so this first environment does not compile `flash-attn`.
+`uv sync` reads this project's [pyproject.toml](pyproject.toml), creates or updates `qpsi/.venv`, and records resolved dependencies in `qpsi/uv.lock`. The project file pins direct inference dependencies and directs Torch and torchvision to the CUDA 12.8 wheel index. No activation is needed. The next command prints the interpreter, wheel, CUDA version, GPU, and supported architectures, then actually runs `torch.zeros` on CUDA. Stop here if that check fails; the checkpoint is not needed to diagnose a Torch kernel error. The Ψ₀ source selects PyTorch SDPA when `flash-attn` is absent, so this first environment does not compile `flash-attn`.
 
 The [Ψ₀ troubleshooting guide](https://github.com/physical-superintelligence-lab/Psi0#troubleshootings) recommends CUDA 12.8 PyTorch for `sm_120`; [uv supports selecting that backend directly](https://docs.astral.sh/uv/guides/integration/pytorch/). CUDA 12.8 requires a sufficiently recent NVIDIA driver; [NVIDIA lists 570.26 or newer for Linux CUDA 12.8 GA](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-toolkit-release-notes/). If `nvidia-smi` reports an older driver or the CUDA allocation fails despite the `+cu128` wheel, record the full output before changing packages.
 
