@@ -51,7 +51,9 @@ def arguments() -> argparse.Namespace:
 
 def quantize_linears(module: nn.Module) -> dict:
     """Apply real W8A8 E4M3 FP8 to supported linears; leave other layers alone."""
-    from torchao.quantization import Float8DynamicActivationFloat8WeightConfig, quantize_
+    from torchao.quantization import (
+        Float8DynamicActivationFloat8WeightConfig, PerTensor, quantize_,
+    )
 
     selected = {
         name: layer.in_features * layer.out_features
@@ -64,7 +66,12 @@ def quantize_linears(module: nn.Module) -> dict:
     }
     if not selected:
         raise ValueError("No FP8 eligible linear layers found")
-    quantize_(module, Float8DynamicActivationFloat8WeightConfig(),
+    config = Float8DynamicActivationFloat8WeightConfig(
+        activation_dtype=torch.float8_e4m3fn,
+        weight_dtype=torch.float8_e4m3fn,
+        granularity=PerTensor(),
+    )
+    quantize_(module, config,
               filter_fn=lambda layer, name: name in selected and isinstance(layer, nn.Linear))
     return {"scheme": "torchao dynamic W8A8 FP8 E4M3 per tensor",
             "torchao_version": package_version("torchao"),
@@ -80,10 +87,17 @@ def file_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
-def dtype_counts(module) -> dict[str, int]:
+def dtype_counts(module, fp8_layer_names=()) -> dict[str, int]:
     counts: Counter[str] = Counter()
-    for parameter in module.parameters():
-        counts[str(parameter.dtype)] += parameter.numel()
+    fp8_weights = {f"{name}.weight" for name in fp8_layer_names}
+    found_fp8 = set()
+    for name, parameter in module.named_parameters():
+        if name in fp8_weights:
+            found_fp8.add(name)
+        dtype = "torch.float8_e4m3fn" if name in fp8_weights else str(parameter.dtype)
+        counts[dtype] += parameter.numel()
+    if found_fp8 != fp8_weights:
+        raise ValueError(f"Missing quantized weights: {sorted(fp8_weights - found_fp8)}")
     return dict(sorted(counts.items()))
 
 
@@ -405,8 +419,11 @@ def main() -> None:
         "pooled_projections_file": "pooled_projections.pt",
         "cuda_device": torch.cuda.get_device_name(device), "torch_version": torch.__version__,
         "torch_cuda_version": torch.version.cuda,
-        "parameter_counts_by_dtype": {"vlm": dtype_counts(model.vlm_model),
-                                      "action_expert": dtype_counts(model.action_header)},
+        "parameter_counts_by_dtype": {
+            "vlm": dtype_counts(model.vlm_model, fp8_layers.get("vlm", {}).get("linear_layers", ())),
+            "action_expert": dtype_counts(model.action_header,
+                                          fp8_layers.get("action_expert", {}).get("linear_layers", ())),
+        },
         "inference_autocast_dtype": "torch.bfloat16",
         "mean_latency_seconds": float(np.mean(latencies)),
         "median_latency_seconds": float(np.median(latencies)),

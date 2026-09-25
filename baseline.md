@@ -47,13 +47,15 @@ mv baseline_results results/vlm_bf16_act_fp32
 mv bf16_action_head_results results/vlm_bf16_act_bf16
 ```
 
-## 2. Compare one run with the reference
+## 2. Compare all saved runs with the reference
 
 ```bash
-./.venv/bin/python compare_results.py results/vlm_bf16_act_bf16
+./.venv/bin/python compare_results.py
 ```
 
-Pass any saved results directory. The script checks checkpoint, dataset, software, GPU, frame IDs, inference seeds, noise, and timesteps before calculating paired action MAE/MSE/cosine, flow-loss change, latency, and VRAM. It writes `comparison.json` and `per_sample.csv` into the passed directory. A positive flow-loss change means greater velocity-prediction error on these UniFolM frames.
+The script finds every completed run under `results/`, checks checkpoint, dataset, software, GPU, frame IDs, inference seeds, noise, and timesteps, then prints one comparison table. It saves the same table as `results/comparison.md` and `results/comparison.csv`. Columns show shared-78 flow MSE, absolute and relative flow-loss change, generated-output MAE/MSE/cosine, latency, and peak VRAM. A positive flow-loss change means greater velocity-prediction error on these UniFolM frames.
+
+The comparison reference is always `vlm_bf16_act_fp32`, the **released** model. It is not the all-BF16 variant. Action MAE, MSE, and cosine compare two *generated normalized action chunks* on the same seeded observation; they are not prediction error against the recorded action. The cosine measures agreement between 30×80 output vectors, not physical direction or robot success. Recorded actions are used to construct the flow-matching target instead. A single recorded trajectory is a weak target for direct generated-action MSE because the model samples one of multiple plausible action chunks.
 
 ## 3. Plot all saved runs
 
@@ -61,6 +63,6 @@ Pass any saved results directory. The script checks checkpoint, dataset, softwar
 ./.venv/bin/python plot_results.py
 ```
 
-This scans `results/` and writes `results/overview.png` with one panel per run. Each panel shows the flow-loss relationship to the released reference, plus its action MAE, mean latency, and peak allocated VRAM. The reference panel shows its flow-loss distribution.
+This scans `results/` and writes `results/overview.png` with one panel per run. The reference panel shows its flow-loss distribution. Every other panel shows the distribution of per-frame flow-loss changes; its text gives mean and relative flow-loss change, generated-output MAE/MSE/cosine, mean latency, and peak allocated VRAM.
 
-The experiment uses 100 evenly spaced full 30-step windows, distributed across the archive's nine episodes. Latency and GPU memory are comparable only for runs made on the same GPU and software environment. Peak allocation covers the timed inference loop after warmup; it is not the size of the checkpoint file or CUDA's reserved-memory total.
+The experiment uses 100 evenly spaced full 30-step windows, distributed across the archive's nine episodes. Frames within an episode are correlated; inspect the per-episode means in each run's `summary.json` when judging whether a mean change is widespread. Latency and GPU memory are comparable only for runs made on the same GPU and software environment. Peak allocation covers the timed inference loop after warmup; it is not the size of the checkpoint file or CUDA's reserved-memory total.

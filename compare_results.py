@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Compare one saved Ψ₀ validation run with the released reference."""
+"""Print and save a table of all Ψ₀ validation runs against the released reference."""
 
 from __future__ import annotations
 
-import argparse
 import csv
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +14,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent
 REFERENCE = ROOT / "results/vlm_bf16_act_fp32"
+RUN_NAME = re.compile(r"vlm_(bf16|fp8)_act_(fp32|bf16|fp8)")
 PAIR_KEYS = ("sample_id", "episode_index", "frame_index")
 ACTION_KEYS = PAIR_KEYS + ("seed", "instruction")
 SUMMARY_KEYS = (
@@ -50,6 +51,17 @@ def load_run(path: Path) -> dict:
     }
 
 
+def discover_runs() -> list[Path]:
+    root = REFERENCE.parent
+    if not (REFERENCE / "summary.json").is_file():
+        raise FileNotFoundError(f"Released reference missing: {REFERENCE}")
+    paths = sorted(path for path in root.iterdir()
+                   if path.is_dir() and RUN_NAME.fullmatch(path.name)
+                   and (path / "summary.json").is_file())
+    paths.remove(REFERENCE)
+    return [REFERENCE, *paths]
+
+
 def check_pairs(left: list[dict], right: list[dict], keys: tuple[str, ...]) -> None:
     if not left or len(left) != len(right):
         raise ValueError("Runs have empty data or different sample counts")
@@ -58,7 +70,7 @@ def check_pairs(left: list[dict], right: list[dict], keys: tuple[str, ...]) -> N
             raise ValueError(f"Samples differ at row {index} on {keys}")
 
 
-def compare_run(reference: dict, variant: dict) -> tuple[dict, list[dict]]:
+def compare_run(reference: dict, variant: dict) -> dict:
     base, other = reference["summary"], variant["summary"]
     if (base.get("vlm_dtype", "bf16"),
         base.get("action_expert_dtype", base.get("action_head_dtype", "fp32"))) != ("bf16", "fp32"):
@@ -92,13 +104,7 @@ def compare_run(reference: dict, variant: dict) -> tuple[dict, list[dict]]:
                        out=np.zeros(len(original)), where=denom > 0)
     cosine[(denom == 0) & np.all(flat_base == flat_other, axis=1)] = 1.0
     flow_delta = other_flow - base_flow
-    episode_delta = {}
-    for episode in sorted({int(row["episode_index"]) for row in reference["losses"]}):
-        positions = [i for i, row in enumerate(reference["losses"])
-                     if int(row["episode_index"]) == episode]
-        episode_delta[str(episode)] = float(flow_delta[positions].mean())
-
-    report = {
+    return {
         "reference": reference["path"].name,
         "variant": variant["path"].name,
         "samples": len(original),
@@ -108,53 +114,84 @@ def compare_run(reference: dict, variant: dict) -> tuple[dict, list[dict]]:
         "flow_loss_shared78_relative_change_percent": (
             float(100 * flow_delta.mean() / base_flow.mean()) if base_flow.mean() else None
         ),
-        "flow_loss_delta_by_episode": episode_delta,
         "action_mae": float(np.abs(error).mean()),
         "action_mse": float(np.square(error).mean()),
         "mean_action_cosine_similarity": float(cosine.mean()),
-        "action_mae_body64": float(np.abs(error[:, :, :64]).mean()),
-        "action_mae_hands14": float(np.abs(error[:, :, 64:78]).mean()),
-        "action_mae_neck2": float(np.abs(error[:, :, 78:]).mean()),
-        "per_action_dimension_mae": np.abs(error).mean(axis=(0, 1)).tolist(),
         "mean_latency_ms_reference": float(base["mean_latency_seconds"] * 1000),
         "mean_latency_ms_variant": float(other["mean_latency_seconds"] * 1000),
         "peak_vram_gib_reference": float(base["peak_inference_vram_bytes"] / 2**30),
         "peak_vram_gib_variant": float(other["peak_inference_vram_bytes"] / 2**30),
     }
-    rows = [
-        {
-            "sample_id": i,
-            "episode_index": row["episode_index"],
-            "frame_index": row["frame_index"],
-            "action_mae": float(np.abs(error[i]).mean()),
-            "action_cosine": float(cosine[i]),
-            "flow_loss_reference": float(base_flow[i]),
-            "flow_loss_variant": float(other_flow[i]),
-            "flow_loss_delta": float(flow_delta[i]),
-        }
-        for i, row in enumerate(reference["actions"])
-    ]
-    return report, rows
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("results_dir", type=Path, help="Saved variant directory under results/")
-    args = parser.parse_args()
-    variant_path = args.results_dir.expanduser().resolve()
+    paths = discover_runs()
     reference = load_run(REFERENCE)
-    variant = load_run(variant_path)
-    report, rows = compare_run(reference, variant)
-    (variant_path / "comparison.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    with (variant_path / "per_sample.csv").open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+    columns = (
+        ("Run", "run"),
+        ("Flow MSE", "flow_mse"),
+        ("Δ flow", "flow_delta"),
+        ("Δ %", "flow_delta_percent"),
+        ("Output MAE", "output_mae"),
+        ("Output MSE", "output_mse"),
+        ("Cosine", "output_cosine"),
+        ("Latency ms", "latency_ms"),
+        ("Peak GiB", "peak_vram_gib"),
+    )
+    records = []
+    for path in paths:
+        report = compare_run(reference, load_run(path))
+        records.append({
+            "run": path.name,
+            "flow_mse": report["flow_loss_shared78_variant"],
+            "flow_delta": report["flow_loss_shared78_delta"],
+            "flow_delta_percent": report["flow_loss_shared78_relative_change_percent"],
+            "output_mae": report["action_mae"],
+            "output_mse": report["action_mse"],
+            "output_cosine": report["mean_action_cosine_similarity"],
+            "latency_ms": report["mean_latency_ms_variant"],
+            "peak_vram_gib": report["peak_vram_gib_variant"],
+        })
+
+    root = REFERENCE.parent
+    csv_path = root / "comparison.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=[key for _, key in columns])
         writer.writeheader()
-        writer.writerows(rows)
-    print(f"{report['variant']}: flow Δ {report['flow_loss_shared78_delta']:+.6g}, "
-          f"action MAE {report['action_mae']:.6g}, "
-          f"latency {report['mean_latency_ms_variant']:.2f} ms, "
-          f"VRAM {report['peak_vram_gib_variant']:.2f} GiB")
-    print(f"Saved {variant_path / 'comparison.json'} and {variant_path / 'per_sample.csv'}")
+        writer.writerows(records)
+
+    def display(key: str, value) -> str:
+        if value is None:
+            return "n/a"
+        if key == "run":
+            return value
+        if key == "output_cosine":
+            return f"{value:.6f}"
+        if key in ("latency_ms", "peak_vram_gib"):
+            return f"{value:.2f}"
+        if key == "flow_delta_percent":
+            return f"{value:+.3f}%"
+        if key == "flow_delta":
+            return f"{value:+.6g}"
+        return f"{value:.6g}"
+
+    headers = [title for title, _ in columns]
+    cells = [[display(key, record[key]) for _, key in columns] for record in records]
+    widths = [max(len(header), *(len(row[i]) for row in cells)) for i, header in enumerate(headers)]
+    lines = ["| " + " | ".join(header.ljust(widths[i]) for i, header in enumerate(headers)) + " |",
+             "| " + " | ".join("-" * width for width in widths) + " |"]
+    lines.extend("| " + " | ".join(value.ljust(widths[i]) for i, value in enumerate(row)) + " |"
+                 for row in cells)
+    table = "\n".join(lines)
+    markdown_path = root / "comparison.md"
+    markdown_path.write_text(
+        "# Ψ₀ validation comparison\n\n"
+        "Reference: `vlm_bf16_act_fp32`. Flow MSE uses the shared 78 dimensions; "
+        "output errors compare generated 30×80 action chunks with the released reference.\n\n"
+        + table + "\n", encoding="utf-8"
+    )
+    print(table)
+    print(f"Saved {markdown_path} and {csv_path}")
 
 
 if __name__ == "__main__":
