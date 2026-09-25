@@ -11,7 +11,7 @@ Keep the [official Ψ₀ checkout](https://github.com/physical-superintelligence
 ```bash
 cd /path/to/qpsi
 uv sync --python 3.11
-./.venv/bin/python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0), torch.cuda.get_arch_list()); print(torch.zeros(1, device="cuda"))'
+uv run --python 3.11 python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0), torch.cuda.get_arch_list()); print(torch.zeros(1, device="cuda"))'
 bash baseline_setup.sh
 ```
 
@@ -20,14 +20,10 @@ bash baseline_setup.sh
 ## 1. Evaluate one precision variant
 
 ```bash
-./.venv/bin/python evaluate.py --vlm bf16 --act fp32
-./.venv/bin/python evaluate.py --vlm bf16 --act bf16
-./.venv/bin/python evaluate.py --vlm bf16 --act fp8
-./.venv/bin/python evaluate.py --vlm fp8 --act fp32
-./.venv/bin/python evaluate.py --vlm fp8 --act fp8
+bash run_all.sh
 ```
 
-Run the released reference first. Each invocation writes `results/vlm_<dtype>_act_<dtype>/` and refuses to overwrite an existing run. Other variants reuse the reference's selected frames, CLIP projections, flow noise, and timesteps. Every run saves:
+The [runner](run_all.sh) evaluates all five variants with `uv run`, then generates the comparison table and plot. It skips completed runs. To run one variant yourself, use `uv run --python 3.11 python evaluate.py --vlm bf16 --act fp32`, replacing the two dtypes as needed. Each invocation writes `results/vlm_<dtype>_act_<dtype>/` and refuses to overwrite an existing run. Other variants reuse the reference's selected frames, CLIP projections, flow noise, and timesteps. Every run saves:
 
 | File | Contents |
 | --- | --- |
@@ -39,18 +35,10 @@ Run the released reference first. Each invocation writes `results/vlm_<dtype>_ac
 
 FP8 uses TorchAO dynamic W8A8 E4M3 quantization on eligible linear layers of the selected component. The remaining layers keep their original precision. `summary.json` lists every converted layer and its weight parameter count. `act bf16` casts the entire action expert, including its output projection, to BF16.
 
-If you already have runs from the earlier scripts, move them into the new layout without rerunning:
-
-```bash
-mkdir -p results
-mv baseline_results results/vlm_bf16_act_fp32
-mv bf16_action_head_results results/vlm_bf16_act_bf16
-```
-
 ## 2. Compare all saved runs with the reference
 
 ```bash
-./.venv/bin/python compare_results.py
+uv run --python 3.11 python compare_results.py
 ```
 
 The script finds every completed run under `results/`, checks checkpoint, dataset, software, GPU, frame IDs, inference seeds, noise, and timesteps, then prints one comparison table. It saves the same table as `results/comparison.md` and `results/comparison.csv`. Columns show shared-78 flow MSE, absolute and relative flow-loss change, generated-output MAE/MSE/cosine, latency, and peak VRAM. A positive flow-loss change means greater velocity-prediction error on these UniFolM frames.
@@ -60,7 +48,7 @@ The comparison reference is always `vlm_bf16_act_fp32`, the **released** model. 
 ## 3. Plot all saved runs
 
 ```bash
-./.venv/bin/python plot_results.py
+uv run --python 3.11 python plot_results.py
 ```
 
 This scans `results/` and writes `results/overview.png` with one panel per run. The reference panel shows its flow-loss distribution. Every other panel shows the distribution of per-frame flow-loss changes; its text gives mean and relative flow-loss change, generated-output MAE/MSE/cosine, mean latency, and peak allocated VRAM.
