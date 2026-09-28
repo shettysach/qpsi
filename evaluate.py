@@ -332,8 +332,7 @@ def read_jsonl(path: Path) -> list[dict]:
         return [json.loads(line) for line in stream if line.strip()]
 
 
-def main() -> None:
-    args = arguments()
+def main(args: argparse.Namespace) -> None:
     vlm_dtype, act_dtype = args.vlm, args.act
     split_autocast = "fp16" in (vlm_dtype, act_dtype)
     vlm_autocast_dtype = torch.float16 if vlm_dtype == "fp16" else torch.bfloat16
@@ -576,10 +575,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    args = arguments()
     try:
-        main()
+        main(args)
     except NonfinitePredictionError as error:
-        args = arguments()
         variant = f"vlm_{args.vlm}_act_{args.act}"
         results = RESULTS_ROOT / variant
         results.mkdir(parents=True, exist_ok=True)
