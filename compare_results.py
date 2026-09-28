@@ -14,7 +14,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent
 REFERENCE = ROOT / "results/vlm_bf16_act_fp32"
-RUN_NAME = re.compile(r"vlm_(bf16|fp16|fp8)_act_(fp32|bf16|fp16|fp8)")
+RUN_NAME = re.compile(r"vlm_(bf16|fp16|fp8)_act_(fp32|bf16|fp16|fp16_bf16proj|fp8)")
 PAIR_KEYS = ("sample_id", "episode_index", "frame_index")
 ACTION_KEYS = PAIR_KEYS + ("seed", "instruction")
 SUMMARY_KEYS = (

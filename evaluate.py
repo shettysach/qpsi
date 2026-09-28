@@ -42,21 +42,45 @@ CHECKPOINT_REVISION = "4c6f9776fc5b18d87945254175e38bb74b9d7748"
 DATA_REVISION = "e78fb93cc28912a3031a10b8656d32d7f0a2b867"
 DATA_SHA256 = "3d264d6454d59e83be5dadaa17f122b732a8c6cb86a2429c33c1f4fc912fc4b7"
 IMAGE_KEY = "observation.images.egocentric"
+HYBRID_ACT = "fp16_bf16proj"
 
 
 class NonfinitePredictionError(ValueError):
     """A precision variant produced NaN or infinity and cannot be scored."""
 
 
+class Bf16ViewProjection(nn.Linear):
+    """Project BF16 VLM features before entering the FP16 action expert."""
+
+    def __init__(self, original: nn.Linear):
+        super().__init__(original.in_features, original.out_features,
+                         bias=original.bias is not None, device=original.weight.device,
+                         dtype=torch.bfloat16)
+        with torch.no_grad():
+            self.weight.copy_(original.weight)
+            if original.bias is not None:
+                self.bias.copy_(original.bias)
+        self.weight.requires_grad_(original.weight.requires_grad)
+        if original.bias is not None:
+            self.bias.requires_grad_(original.bias.requires_grad)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            projected = nn.functional.linear(features, self.weight, self.bias)
+        return projected.to(torch.float16)
+
+
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a Ψ₀ precision variant on fixed SONIC data.")
     parser.add_argument("--vlm", choices=("bf16", "fp16", "fp8"), required=True,
                         help="VLM weights: released BF16, full FP16, or FP8 eligible linear layers")
-    parser.add_argument("--act", choices=("fp32", "bf16", "fp16", "fp8"), required=True,
-                        help="Action expert weights: released FP32, BF16, full FP16, or FP8 eligible linear layers")
+    parser.add_argument("--act", choices=("fp32", "bf16", "fp16", HYBRID_ACT, "fp8"), required=True,
+                        help="Action expert weights: FP32, BF16, FP16, FP16 with BF16 input projection, or FP8")
     args = parser.parse_args()
-    if "fp16" in (args.vlm, args.act) and "fp8" in (args.vlm, args.act):
+    if (args.vlm == "fp8" and args.act in ("fp16", HYBRID_ACT)) or (args.vlm == "fp16" and args.act == "fp8"):
         parser.error("FP16 and FP8 combinations are not included in this experiment")
+    if args.act == HYBRID_ACT and args.vlm != "bf16":
+        parser.error("The BF16 input projection variant requires --vlm bf16")
     return args
 
 
@@ -218,7 +242,8 @@ def normalize_actions(actions78: np.ndarray, field) -> np.ndarray:
 
 
 def predict_mixed(model, image, state, instruction, projection, steps,
-                  vlm_autocast_dtype, action_autocast_dtype, diagnostics=False):
+                  vlm_autocast_dtype, action_autocast_dtype, hybrid_projection=False,
+                  diagnostics=False):
     """Run upstream single-view flow inference with separate component autocast.
 
     Upstream predict_action hardcodes one BF16 autocast region for both components.
@@ -254,34 +279,45 @@ def predict_mixed(model, image, state, instruction, projection, steps,
         views = model._select_vlm_views(output.hidden_states)
         if diagnostics:
             require_finite(views, "VLM features")
-    views = views.to(dtype=action_autocast_dtype)
+    views = views.to(dtype=torch.bfloat16 if hybrid_projection else action_autocast_dtype)
     if diagnostics:
         require_finite(views, "VLM features converted for action expert")
-    with torch.inference_mode(), torch.autocast("cuda", dtype=action_autocast_dtype):
-        action = torch.randn(1, model.action_horizon, model.action_dim, device=model.device)
-        model.noise_scheduler.set_timesteps(steps)
-        for step_index, timestep in enumerate(model.noise_scheduler.timesteps):
-            prediction = model.action_header(
-                hidden_states=None, timestep=timestep.expand(1).to(model.device),
-                pooled_projections=projection,
-                joint_attention_kwargs=dict(
-                    action_hidden_embeds=action, views=views, obs=state, traj2ds=None,
-                ),
-                vlm_attn_mask=attention_mask, return_dict=True,
-            ).action
-            if diagnostics:
-                require_finite(prediction, f"action expert output at step {step_index}")
-            action = model.noise_scheduler.step(
-                model_output=prediction, timestep=timestep, sample=action
-            ).prev_sample
-            if diagnostics:
-                require_finite(action, f"scheduler output at step {step_index}")
+    projection_check = None
+    if diagnostics and hybrid_projection:
+        projection_check = model.action_header.obs_proj.views_proj.register_forward_hook(
+            lambda _module, _inputs, output: require_finite(
+                output, "BF16 view projection output converted to FP16"
+            )
+        )
+    try:
+        with torch.inference_mode(), torch.autocast("cuda", dtype=action_autocast_dtype):
+            action = torch.randn(1, model.action_horizon, model.action_dim, device=model.device)
+            model.noise_scheduler.set_timesteps(steps)
+            for step_index, timestep in enumerate(model.noise_scheduler.timesteps):
+                prediction = model.action_header(
+                    hidden_states=None, timestep=timestep.expand(1).to(model.device),
+                    pooled_projections=projection,
+                    joint_attention_kwargs=dict(
+                        action_hidden_embeds=action, views=views, obs=state, traj2ds=None,
+                    ),
+                    vlm_attn_mask=attention_mask, return_dict=True,
+                ).action
+                if diagnostics:
+                    require_finite(prediction, f"action expert output at step {step_index}")
+                action = model.noise_scheduler.step(
+                    model_output=prediction, timestep=timestep, sample=action
+                ).prev_sample
+                if diagnostics:
+                    require_finite(action, f"scheduler output at step {step_index}")
+    finally:
+        if projection_check is not None:
+            projection_check.remove()
     return action.float()
 
 
 def evaluate_flow(model, image, state, instruction, projection, target, sigma, noise, train_steps,
                   vlm_autocast_dtype=torch.bfloat16, action_autocast_dtype=torch.bfloat16,
-                  split_autocast=False):
+                  split_autocast=False, hybrid_projection=False):
     from qwen_vl_utils import process_vision_info
 
     messages = [[{"role": "user", "content": [
@@ -304,7 +340,7 @@ def evaluate_flow(model, image, state, instruction, projection, target, sigma, n
                     output_hidden_states=True, return_dict=True,
                 ).hidden_states
                 views = model._select_vlm_views(hidden)
-            views = views.to(dtype=action_autocast_dtype)
+            views = views.to(dtype=torch.bfloat16 if hybrid_projection else action_autocast_dtype)
             with torch.autocast("cuda", dtype=action_autocast_dtype):
                 prediction = model.action_header(
                     hidden_states=None, timestep=timestep, pooled_projections=projection,
@@ -334,9 +370,10 @@ def read_jsonl(path: Path) -> list[dict]:
 
 def main(args: argparse.Namespace) -> None:
     vlm_dtype, act_dtype = args.vlm, args.act
-    split_autocast = "fp16" in (vlm_dtype, act_dtype)
+    hybrid_projection = act_dtype == HYBRID_ACT
+    split_autocast = vlm_dtype == "fp16" or act_dtype in ("fp16", HYBRID_ACT)
     vlm_autocast_dtype = torch.float16 if vlm_dtype == "fp16" else torch.bfloat16
-    action_autocast_dtype = torch.float16 if act_dtype == "fp16" else torch.bfloat16
+    action_autocast_dtype = torch.float16 if act_dtype in ("fp16", HYBRID_ACT) else torch.bfloat16
     variant = f"vlm_{vlm_dtype}_act_{act_dtype}"
     results = RESULTS_ROOT / variant
     is_reference = results == REFERENCE_RESULTS
@@ -417,10 +454,16 @@ def main(args: argparse.Namespace) -> None:
             ):
                 raise ValueError(f"Reference sample {index} differs from selected validation frame")
     model = Psi0Model.from_pretrained(checkpoint, CHECKPOINT_STEP, launch, device=device).to(device).eval()
-    if act_dtype in ("bf16", "fp16"):
+    if act_dtype in ("bf16", "fp16", HYBRID_ACT):
+        input_projection = (Bf16ViewProjection(model.action_header.obs_proj.views_proj)
+                            if hybrid_projection else None)
         target_dtype = torch.bfloat16 if act_dtype == "bf16" else torch.float16
         model.action_header.to(dtype=target_dtype)
-        if any(parameter.dtype != target_dtype for parameter in model.action_header.parameters()):
+        if input_projection is not None:
+            model.action_header.obs_proj.views_proj = input_projection
+        if any(parameter.dtype != (torch.bfloat16 if hybrid_projection and
+                                   name.startswith("obs_proj.views_proj.") else target_dtype)
+               for name, parameter in model.action_header.named_parameters()):
             raise ValueError(f"Action head contains weights that were not cast to {act_dtype}")
     if vlm_dtype == "fp16":
         model.vlm_model.to(dtype=torch.float16)
@@ -458,7 +501,8 @@ def main(args: argparse.Namespace) -> None:
         if split_autocast:
             return predict_mixed(model, row["image"], row["state"],
                                  row["instruction"], projection, steps,
-                                 vlm_autocast_dtype, action_autocast_dtype, diagnostics)
+                                 vlm_autocast_dtype, action_autocast_dtype,
+                                 hybrid_projection, diagnostics)
         with torch.inference_mode():
             return model.predict_action(
                 observations=[[row["image"]]], states=row["state"],
@@ -510,6 +554,7 @@ def main(args: argparse.Namespace) -> None:
                 row["target"], float(sigmas[index]), noise[index],
                 int(launch.model.train_diffusion_steps),
                 vlm_autocast_dtype, action_autocast_dtype, split_autocast,
+                hybrid_projection,
             )
         except NonfinitePredictionError as error:
             raise NonfinitePredictionError(f"{variant} flow sample {index}: {error}") from error
@@ -531,6 +576,7 @@ def main(args: argparse.Namespace) -> None:
         "reference": None if is_reference else REFERENCE_RESULTS.name,
         "vlm_dtype": vlm_dtype,
         "action_expert_dtype": act_dtype,
+        "action_input_projection_dtype": "torch.bfloat16" if hybrid_projection else None,
         "fp8_quantization": fp8_layers,
         "checkpoint": CHECKPOINT, "checkpoint_step": CHECKPOINT_STEP,
         "checkpoint_revision": CHECKPOINT_REVISION,
