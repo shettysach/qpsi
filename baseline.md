@@ -6,7 +6,7 @@ The archive supplies 64 body and 14 hand action targets. The checkpoint also pre
 
 ## Environment and data
 
-Keep the [official Ψ₀ checkout](https://github.com/physical-superintelligence-lab/Psi0) at `/home/sach/Desktop/Psi0`. The checkpoint and dataset paths, seed, 100 samples, and 10 inference steps are fixed near the top of [evaluate.py](evaluate.py). On the RTX 5090 machine:
+Keep the [official Ψ₀ checkout](https://github.com/physical-superintelligence-lab/Psi0) at `/home/sach/Desktop/Psi0`. The checkpoint defaults to the sibling `../rlora/artifacts/psi-model/psi0/sonic-checkpoints/multi-task.psi-dream.2609092156` path used by rlora. Set `PSI_CHECKPOINT_CACHE` to a different `psi-model` directory if the repos are not siblings. Set `PSI_REPO` if the official checkout is elsewhere; the validation archive remains under its `.data` directory. The seed, 100 samples, and 10 inference steps are fixed near the top of [evaluate.py](evaluate.py). On the RTX 5090 machine:
 
 ```bash
 cd /path/to/qpsi
@@ -23,7 +23,7 @@ bash baseline_setup.sh
 bash run_all.sh
 ```
 
-The [runner](run_all.sh) evaluates all five variants with `uv run`, then generates the comparison table and plot. It skips completed runs. To run one variant yourself, use `uv run --python 3.11 python evaluate.py --vlm bf16 --act fp32`, replacing the two dtypes as needed. Each invocation writes `results/vlm_<dtype>_act_<dtype>/` and refuses to overwrite an existing run. Other variants reuse the reference's selected frames, CLIP projections, flow noise, and timesteps. Every run saves:
+The [runner](run_all.sh) evaluates all nine variants with `uv run`, then generates the comparison table and plot. It skips completed runs. To run one variant yourself, use `uv run --python 3.11 python evaluate.py --vlm bf16 --act fp32`, replacing the two dtypes as needed. FP16 and FP8 are not combined. Each invocation writes `results/vlm_<dtype>_act_<dtype>/` and refuses to overwrite an existing run. Other variants reuse the reference's selected frames, CLIP projections, flow noise, and timesteps. Every run saves:
 
 | File | Contents |
 | --- | --- |
@@ -33,7 +33,7 @@ The [runner](run_all.sh) evaluates all five variants with `uv run`, then generat
 | `flow_noise.npy`, `flow_sigmas.npy` | Fixed noise and timesteps for paired flow loss. |
 | `pooled_projections.pt` | Frozen CLIP instruction projections used by the run. |
 
-FP8 uses TorchAO dynamic W8A8 E4M3 quantization on eligible linear layers of the selected component. The remaining layers keep their original precision. `summary.json` lists every converted layer and its weight parameter count. `act bf16` casts the entire action expert, including its output projection, to BF16.
+FP8 uses TorchAO dynamic W8A8 E4M3 quantization on eligible linear layers of the selected component. The remaining layers keep their original precision. `summary.json` lists every converted layer and its weight parameter count. `act bf16` casts the entire action expert, including its output projection, to BF16. The FP16 runs complete a 2×3 grid: VLM BF16 or FP16 crossed with action expert FP32, BF16, or FP16. Each FP16 component has FP16 weights and FP16 autocast; the other component keeps BF16 autocast and its listed weight dtype. These runs use separate VLM and action expert autocast regions in the upstream single-view Euler path because upstream `predict_action` hardcodes one BF16 autocast region. Inspect `vlm_autocast_dtype`, `action_autocast_dtype`, and `parameter_counts_by_dtype` in each summary when comparing latency and memory.
 
 ## 2. Compare all saved runs with the reference
 

@@ -19,6 +19,10 @@ run_variant() {
 
 run_variant bf16 fp32
 run_variant bf16 bf16
+run_variant bf16 fp16
+run_variant fp16 fp32
+run_variant fp16 bf16
+run_variant fp16 fp16
 run_variant bf16 fp8
 run_variant fp8 fp32
 run_variant fp8 fp8

@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PSI_REPO="/home/sach/Desktop/Psi0"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PSI_REPO="${PSI_REPO:-/home/sach/Desktop/Psi0}"
 CHECKPOINT="psi0/sonic-checkpoints/multi-task.psi-dream.2609092156"
 HF_REPO="USC-PSI-Lab/psi-model"
 CHECKPOINT_REVISION="4c6f9776fc5b18d87945254175e38bb74b9d7748"
-CHECKPOINT_CACHE="$PSI_REPO/cache/checkpoints"
+CHECKPOINT_CACHE="${PSI_CHECKPOINT_CACHE:-$ROOT/../rlora/artifacts/psi-model}"
 DATASET_ROOT="$PSI_REPO/.data"
 DATASET_REVISION="e78fb93cc28912a3031a10b8656d32d7f0a2b867"
 

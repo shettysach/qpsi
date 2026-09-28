@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import random
 import sys
 import time
@@ -25,8 +26,11 @@ from torch import nn
 
 
 ROOT = Path(__file__).resolve().parent
-PSI_REPO = Path("/home/sach/Desktop/Psi0")
+PSI_REPO = Path(os.environ.get("PSI_REPO", "/home/sach/Desktop/Psi0"))
 CHECKPOINT = "psi0/sonic-checkpoints/multi-task.psi-dream.2609092156"
+CHECKPOINT_CACHE = Path(os.environ.get(
+    "PSI_CHECKPOINT_CACHE", ROOT.parent / "rlora/artifacts/psi-model"
+))
 VALIDATION_DATASET = Path(".data/unifolm_sonic_lerobot_val")
 SEED = 0
 SAMPLES = 100
@@ -42,11 +46,14 @@ IMAGE_KEY = "observation.images.egocentric"
 
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a Ψ₀ precision variant on fixed SONIC data.")
-    parser.add_argument("--vlm", choices=("bf16", "fp8"), required=True,
-                        help="VLM weights: released BF16 or FP8 eligible linear layers")
-    parser.add_argument("--act", choices=("fp32", "bf16", "fp8"), required=True,
-                        help="Action expert weights: released FP32, BF16, or FP8 eligible linear layers")
-    return parser.parse_args()
+    parser.add_argument("--vlm", choices=("bf16", "fp16", "fp8"), required=True,
+                        help="VLM weights: released BF16, full FP16, or FP8 eligible linear layers")
+    parser.add_argument("--act", choices=("fp32", "bf16", "fp16", "fp8"), required=True,
+                        help="Action expert weights: released FP32, BF16, full FP16, or FP8 eligible linear layers")
+    args = parser.parse_args()
+    if "fp16" in (args.vlm, args.act) and "fp8" in (args.vlm, args.act):
+        parser.error("FP16 and FP8 combinations are not included in this experiment")
+    return args
 
 
 def quantize_linears(module: nn.Module) -> dict:
@@ -206,7 +213,55 @@ def normalize_actions(actions78: np.ndarray, field) -> np.ndarray:
     return values
 
 
-def evaluate_flow(model, image, state, instruction, projection, target, sigma, noise, train_steps):
+def predict_mixed(model, image, state, instruction, projection, steps,
+                  vlm_autocast_dtype, action_autocast_dtype):
+    """Run upstream single-view flow inference with separate component autocast.
+
+    Upstream predict_action hardcodes one BF16 autocast region for both components.
+    """
+    from qwen_vl_utils import process_vision_info
+
+    messages = [[{"role": "user", "content": [
+        {"type": "image", "image": image}, {"type": "text", "text": instruction}
+    ]}]]
+    prompt = model.vlm_processor.apply_chat_template(
+        messages[0], tokenize=False, add_generation_prompt=True
+    )
+    image_inputs, video_inputs = process_vision_info(messages, image_patch_size=16)
+    inputs = model.vlm_processor(
+        text=[prompt], images=image_inputs, videos=video_inputs,
+        padding=True, return_tensors="pt"
+    ).to(model.device)
+    input_ids, attention_mask = model._collate_vlm_batch([inputs["input_ids"].squeeze(0)])
+    with torch.inference_mode(), torch.autocast("cuda", dtype=vlm_autocast_dtype):
+        output = model.vlm_model(
+            input_ids=input_ids, attention_mask=attention_mask,
+            pixel_values=inputs["pixel_values"], image_grid_thw=inputs["image_grid_thw"],
+            output_hidden_states=True, return_dict=True,
+        )
+        views = model._select_vlm_views(output.hidden_states)
+    views = views.to(dtype=action_autocast_dtype)
+    with torch.inference_mode(), torch.autocast("cuda", dtype=action_autocast_dtype):
+        action = torch.randn(1, model.action_horizon, model.action_dim, device=model.device)
+        model.noise_scheduler.set_timesteps(steps)
+        for timestep in model.noise_scheduler.timesteps:
+            prediction = model.action_header(
+                hidden_states=None, timestep=timestep.expand(1).to(model.device),
+                pooled_projections=projection,
+                joint_attention_kwargs=dict(
+                    action_hidden_embeds=action, views=views, obs=state, traj2ds=None,
+                ),
+                vlm_attn_mask=attention_mask, return_dict=True,
+            ).action
+            action = model.noise_scheduler.step(
+                model_output=prediction, timestep=timestep, sample=action
+            ).prev_sample
+    return action.float()
+
+
+def evaluate_flow(model, image, state, instruction, projection, target, sigma, noise, train_steps,
+                  vlm_autocast_dtype=torch.bfloat16, action_autocast_dtype=torch.bfloat16,
+                  split_autocast=False):
     from qwen_vl_utils import process_vision_info
 
     messages = [[{"role": "user", "content": [
@@ -220,13 +275,32 @@ def evaluate_flow(model, image, state, instruction, projection, target, sigma, n
     epsilon = torch.from_numpy(noise).unsqueeze(0).to(model.device)
     timestep = torch.tensor([sigma * train_steps], device=model.device, dtype=torch.float32)
     noisy = (1 - sigma) * clean + sigma * epsilon
-    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-        prediction = model(
-            input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"],
-            pixel_values=inputs["pixel_values"], image_grid_thw=inputs["image_grid_thw"],
-            action_samples=noisy, states=state, timestep=timestep,
-            traj2ds=None, pooled_projections=projection,
-        ).action
+    with torch.inference_mode():
+        if split_autocast:
+            with torch.autocast("cuda", dtype=vlm_autocast_dtype):
+                hidden = model.vlm_model(
+                    input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"],
+                    pixel_values=inputs["pixel_values"], image_grid_thw=inputs["image_grid_thw"],
+                    output_hidden_states=True, return_dict=True,
+                ).hidden_states
+                views = model._select_vlm_views(hidden)
+            views = views.to(dtype=action_autocast_dtype)
+            with torch.autocast("cuda", dtype=action_autocast_dtype):
+                prediction = model.action_header(
+                    hidden_states=None, timestep=timestep, pooled_projections=projection,
+                    joint_attention_kwargs=dict(
+                        action_hidden_embeds=noisy, views=views, obs=state, traj2ds=None,
+                    ),
+                    vlm_attn_mask=inputs["attention_mask"], return_dict=True,
+                ).action
+        else:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                prediction = model(
+                    input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"],
+                    pixel_values=inputs["pixel_values"], image_grid_thw=inputs["image_grid_thw"],
+                    action_samples=noisy, states=state, timestep=timestep,
+                    traj2ds=None, pooled_projections=projection,
+                ).action
     squared = (prediction.float() - (epsilon - clean)).square()[0, :, :78]
     if not torch.isfinite(squared).all():
         raise ValueError("Nonfinite flow loss")
@@ -241,6 +315,9 @@ def read_jsonl(path: Path) -> list[dict]:
 def main() -> None:
     args = arguments()
     vlm_dtype, act_dtype = args.vlm, args.act
+    split_autocast = "fp16" in (vlm_dtype, act_dtype)
+    vlm_autocast_dtype = torch.float16 if vlm_dtype == "fp16" else torch.bfloat16
+    action_autocast_dtype = torch.float16 if act_dtype == "fp16" else torch.bfloat16
     variant = f"vlm_{vlm_dtype}_act_{act_dtype}"
     results = RESULTS_ROOT / variant
     is_reference = results == REFERENCE_RESULTS
@@ -256,7 +333,7 @@ def main() -> None:
     archive = dataset.parent / "sonic/unifolm_sonic_lerobot_val.zip"
     if not archive.is_file() or file_hash(archive) != DATA_SHA256:
         raise ValueError(f"Expected pinned validation archive at {archive}, SHA256 {DATA_SHA256}")
-    checkpoint = repo / "cache/checkpoints" / CHECKPOINT
+    checkpoint = CHECKPOINT_CACHE.expanduser().resolve() / CHECKPOINT
     weights = checkpoint / f"checkpoints/ckpt_{CHECKPOINT_STEP}/model.safetensors"
     for path in (weights, checkpoint / "argv.txt", checkpoint / "run_config.json", checkpoint / "clip_pooled_cache.pt"):
         if not path.is_file():
@@ -317,10 +394,15 @@ def main() -> None:
             ):
                 raise ValueError(f"Reference sample {index} differs from selected validation frame")
     model = Psi0Model.from_pretrained(checkpoint, CHECKPOINT_STEP, launch, device=device).to(device).eval()
-    if act_dtype == "bf16":
-        model.action_header.to(dtype=torch.bfloat16)
-        if any(parameter.dtype != torch.bfloat16 for parameter in model.action_header.parameters()):
-            raise ValueError("Action head contains weights that were not cast to BF16")
+    if act_dtype in ("bf16", "fp16"):
+        target_dtype = torch.bfloat16 if act_dtype == "bf16" else torch.float16
+        model.action_header.to(dtype=target_dtype)
+        if any(parameter.dtype != target_dtype for parameter in model.action_header.parameters()):
+            raise ValueError(f"Action head contains weights that were not cast to {act_dtype}")
+    if vlm_dtype == "fp16":
+        model.vlm_model.to(dtype=torch.float16)
+        if any(parameter.dtype != torch.float16 for parameter in model.vlm_model.parameters()):
+            raise ValueError("VLM contains weights that were not cast to FP16")
     fp8_layers = {}
     if vlm_dtype == "fp8":
         fp8_layers["vlm"] = quantize_linears(model.vlm_model)
@@ -355,6 +437,10 @@ def main() -> None:
 
     def predict(row):
         projection = vectors[row["instruction"]].unsqueeze(0).to(device)
+        if split_autocast:
+            return predict_mixed(model, row["image"], row["state"],
+                                 row["instruction"], projection, steps,
+                                 vlm_autocast_dtype, action_autocast_dtype)
         with torch.inference_mode():
             return model.predict_action(
                 observations=[[row["image"]]], states=row["state"],
@@ -392,6 +478,7 @@ def main() -> None:
             model, row["image"], row["state"], row["instruction"], projection,
             row["target"], float(sigmas[index]), noise[index],
             int(launch.model.train_diffusion_steps),
+            vlm_autocast_dtype, action_autocast_dtype, split_autocast,
         )
         losses.append(dict(sample_id=index, episode_index=row["episode_index"],
                            frame_index=row["frame_index"], shared78_mse=shared,
@@ -433,7 +520,11 @@ def main() -> None:
             "action_expert": dtype_counts(model.action_header,
                                           fp8_layers.get("action_expert", {}).get("linear_layers", ())),
         },
-        "inference_autocast_dtype": "torch.bfloat16",
+        "inference_autocast_dtype": (
+            str(vlm_autocast_dtype) if vlm_autocast_dtype == action_autocast_dtype else "mixed"
+        ),
+        "vlm_autocast_dtype": str(vlm_autocast_dtype),
+        "action_autocast_dtype": str(action_autocast_dtype),
         "mean_latency_seconds": float(np.mean(latencies)),
         "median_latency_seconds": float(np.median(latencies)),
         "p95_latency_seconds": float(np.percentile(latencies, 95)),
