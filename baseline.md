@@ -23,7 +23,7 @@ bash baseline_setup.sh
 bash run_all.sh
 ```
 
-The [runner](run_all.sh) evaluates all nine variants with `uv run`, then generates the comparison table and plot. It skips completed runs. To run one variant yourself, use `uv run --python 3.11 python evaluate.py --vlm bf16 --act fp32`, replacing the two dtypes as needed. FP16 and FP8 are not combined. Each invocation writes `results/vlm_<dtype>_act_<dtype>/` and refuses to overwrite an existing run. Other variants reuse the reference's selected frames, CLIP projections, flow noise, and timesteps. Every run saves:
+The [runner](run_all.sh) evaluates all nine variants with `uv run`, then generates the comparison table and plot. It skips completed runs. To run one variant yourself, use `uv run --python 3.11 python evaluate.py --vlm bf16 --act fp32`, replacing the two dtypes as needed. FP16 and FP8 are not combined. Each invocation writes `results/vlm_<dtype>_act_<dtype>/` and refuses to overwrite an existing completed run. Other variants reuse the reference's selected frames, CLIP projections, flow noise, and timesteps. Every completed run saves:
 
 | File | Contents |
 | --- | --- |
@@ -34,6 +34,8 @@ The [runner](run_all.sh) evaluates all nine variants with `uv run`, then generat
 | `pooled_projections.pt` | Frozen CLIP instruction projections used by the run. |
 
 FP8 uses TorchAO dynamic W8A8 E4M3 quantization on eligible linear layers of the selected component. The remaining layers keep their original precision. `summary.json` lists every converted layer and its weight parameter count. `act bf16` casts the entire action expert, including its output projection, to BF16. The FP16 runs complete a 2×3 grid: VLM BF16 or FP16 crossed with action expert FP32, BF16, or FP16. Each FP16 component has FP16 weights and FP16 autocast; the other component keeps BF16 autocast and its listed weight dtype. These runs use separate VLM and action expert autocast regions in the upstream single-view Euler path because upstream `predict_action` hardcodes one BF16 autocast region. Inspect `vlm_autocast_dtype`, `action_autocast_dtype`, and `parameter_counts_by_dtype` in each summary when comparing latency and memory.
+
+If a precision variant produces NaN or infinity, it gets a `failure.json` with the failing stage instead of a comparison score. The runner continues with other variants and exits with an error after writing the available comparison and plot. Remove that variant's `failure.json` to retry it. The script also accepts the three input files left by earlier failed runs and replaces them only after a successful evaluation.
 
 ## 2. Compare all saved runs with the reference
 

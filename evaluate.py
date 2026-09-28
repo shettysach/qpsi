@@ -44,6 +44,10 @@ DATA_SHA256 = "3d264d6454d59e83be5dadaa17f122b732a8c6cb86a2429c33c1f4fc912fc4b7"
 IMAGE_KEY = "observation.images.egocentric"
 
 
+class NonfinitePredictionError(ValueError):
+    """A precision variant produced NaN or infinity and cannot be scored."""
+
+
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a Ψ₀ precision variant on fixed SONIC data.")
     parser.add_argument("--vlm", choices=("bf16", "fp16", "fp8"), required=True,
@@ -214,12 +218,20 @@ def normalize_actions(actions78: np.ndarray, field) -> np.ndarray:
 
 
 def predict_mixed(model, image, state, instruction, projection, steps,
-                  vlm_autocast_dtype, action_autocast_dtype):
+                  vlm_autocast_dtype, action_autocast_dtype, diagnostics=False):
     """Run upstream single-view flow inference with separate component autocast.
 
     Upstream predict_action hardcodes one BF16 autocast region for both components.
     """
     from qwen_vl_utils import process_vision_info
+
+    def require_finite(value, stage):
+        if not torch.isfinite(value).all():
+            invalid = int((~torch.isfinite(value)).sum().item())
+            raise NonfinitePredictionError(
+                f"Nonfinite {stage}: {invalid}/{value.numel()} values "
+                f"(VLM autocast {vlm_autocast_dtype}, action autocast {action_autocast_dtype})"
+            )
 
     messages = [[{"role": "user", "content": [
         {"type": "image", "image": image}, {"type": "text", "text": instruction}
@@ -240,11 +252,15 @@ def predict_mixed(model, image, state, instruction, projection, steps,
             output_hidden_states=True, return_dict=True,
         )
         views = model._select_vlm_views(output.hidden_states)
+        if diagnostics:
+            require_finite(views, "VLM features")
     views = views.to(dtype=action_autocast_dtype)
+    if diagnostics:
+        require_finite(views, "VLM features converted for action expert")
     with torch.inference_mode(), torch.autocast("cuda", dtype=action_autocast_dtype):
         action = torch.randn(1, model.action_horizon, model.action_dim, device=model.device)
         model.noise_scheduler.set_timesteps(steps)
-        for timestep in model.noise_scheduler.timesteps:
+        for step_index, timestep in enumerate(model.noise_scheduler.timesteps):
             prediction = model.action_header(
                 hidden_states=None, timestep=timestep.expand(1).to(model.device),
                 pooled_projections=projection,
@@ -253,9 +269,13 @@ def predict_mixed(model, image, state, instruction, projection, steps,
                 ),
                 vlm_attn_mask=attention_mask, return_dict=True,
             ).action
+            if diagnostics:
+                require_finite(prediction, f"action expert output at step {step_index}")
             action = model.noise_scheduler.step(
                 model_output=prediction, timestep=timestep, sample=action
             ).prev_sample
+            if diagnostics:
+                require_finite(action, f"scheduler output at step {step_index}")
     return action.float()
 
 
@@ -303,7 +323,7 @@ def evaluate_flow(model, image, state, instruction, projection, target, sigma, n
                 ).action
     squared = (prediction.float() - (epsilon - clean)).square()[0, :, :78]
     if not torch.isfinite(squared).all():
-        raise ValueError("Nonfinite flow loss")
+        raise NonfinitePredictionError("Nonfinite flow loss")
     return [float(squared[:, a:b].mean().item()) for a, b in ((0, 78), (0, 64), (64, 78))]
 
 
@@ -321,8 +341,12 @@ def main() -> None:
     variant = f"vlm_{vlm_dtype}_act_{act_dtype}"
     results = RESULTS_ROOT / variant
     is_reference = results == REFERENCE_RESULTS
-    if results.exists() and any(results.iterdir()):
-        raise FileExistsError(f"Results already exist: {results}; move them before rerunning")
+    if results.exists():
+        # Older failed runs may have written these inputs before producing a summary.
+        partial_inputs = {"pooled_projections.pt", "flow_sigmas.npy", "flow_noise.npy",
+                          "failure.json"}
+        if {path.name for path in results.iterdir()} - partial_inputs:
+            raise FileExistsError(f"Results already exist: {results}; move them before rerunning")
     repo = PSI_REPO.expanduser().resolve()
     dataset = VALIDATION_DATASET.expanduser()
     dataset = (dataset if dataset.is_absolute() else repo / dataset).resolve()
@@ -421,8 +445,6 @@ def main() -> None:
         padded = np.pad(row["state"], (0, 2))
         row["state"] = torch.from_numpy(field.normalize_state_func(padded)).reshape(1, 1, 45).to(device)
         row["target"] = normalize_actions(row["actions"], field)
-    results.mkdir(parents=True, exist_ok=True)
-    torch.save(vectors, results / "pooled_projections.pt")
     if not is_reference:
         sigmas = np.load(REFERENCE_RESULTS / "flow_sigmas.npy", allow_pickle=False)
         noise = np.load(REFERENCE_RESULTS / "flow_noise.npy", allow_pickle=False)
@@ -432,15 +454,12 @@ def main() -> None:
         rng = torch.Generator(device="cpu").manual_seed(seed)
         sigmas = torch.rand(samples, generator=rng).numpy().astype(np.float32)
         noise = torch.randn((samples, 30, 80), generator=rng).numpy().astype(np.float32)
-    np.save(results / "flow_sigmas.npy", sigmas)
-    np.save(results / "flow_noise.npy", noise)
-
-    def predict(row):
+    def predict(row, diagnostics=False):
         projection = vectors[row["instruction"]].unsqueeze(0).to(device)
         if split_autocast:
             return predict_mixed(model, row["image"], row["state"],
                                  row["instruction"], projection, steps,
-                                 vlm_autocast_dtype, action_autocast_dtype)
+                                 vlm_autocast_dtype, action_autocast_dtype, diagnostics)
         with torch.inference_mode():
             return model.predict_action(
                 observations=[[row["image"]]], states=row["state"],
@@ -463,7 +482,19 @@ def main() -> None:
         latency = time.perf_counter() - start
         values = output.detach().float().cpu().numpy()
         if values.shape != (1, 30, 80) or not np.isfinite(values).all():
-            raise ValueError(f"Invalid prediction for sample {index}: {values.shape}")
+            if values.shape == (1, 30, 80) and split_autocast:
+                torch.manual_seed(sample_seed)
+                torch.cuda.manual_seed_all(sample_seed)
+                try:
+                    predict(row, diagnostics=True)
+                except NonfinitePredictionError as error:
+                    raise NonfinitePredictionError(
+                        f"{variant} sample {index}: {error}"
+                    ) from error
+            raise NonfinitePredictionError(
+                f"Invalid prediction for {variant} sample {index}: shape {values.shape}, "
+                f"nonfinite values {int((~np.isfinite(values)).sum())}"
+            )
         latencies.append(latency)
         actions.append(dict(sample_id=index, seed=sample_seed,
                             episode_index=row["episode_index"], frame_index=row["frame_index"],
@@ -474,17 +505,24 @@ def main() -> None:
     losses = []
     for index, row in enumerate(examples):
         projection = vectors[row["instruction"]].unsqueeze(0).to(device)
-        shared, body, hands = evaluate_flow(
-            model, row["image"], row["state"], row["instruction"], projection,
-            row["target"], float(sigmas[index]), noise[index],
-            int(launch.model.train_diffusion_steps),
-            vlm_autocast_dtype, action_autocast_dtype, split_autocast,
-        )
+        try:
+            shared, body, hands = evaluate_flow(
+                model, row["image"], row["state"], row["instruction"], projection,
+                row["target"], float(sigmas[index]), noise[index],
+                int(launch.model.train_diffusion_steps),
+                vlm_autocast_dtype, action_autocast_dtype, split_autocast,
+            )
+        except NonfinitePredictionError as error:
+            raise NonfinitePredictionError(f"{variant} flow sample {index}: {error}") from error
         losses.append(dict(sample_id=index, episode_index=row["episode_index"],
                            frame_index=row["frame_index"], shared78_mse=shared,
                            body64_mse=body, hands14_mse=hands))
         print(f"Flow loss {index + 1}/{samples}: {shared:.5f}", flush=True)
 
+    results.mkdir(parents=True, exist_ok=True)
+    torch.save(vectors, results / "pooled_projections.pt")
+    np.save(results / "flow_sigmas.npy", sigmas)
+    np.save(results / "flow_noise.npy", noise)
     for name, rows in (("actions.jsonl", actions), ("flow_losses.jsonl", losses)):
         with (results / name).open("w", encoding="utf-8") as stream:
             for row in rows:
@@ -533,8 +571,21 @@ def main() -> None:
         "actions_file": "actions.jsonl", "flow_losses_file": "flow_losses.jsonl",
     }
     (results / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    (results / "failure.json").unlink(missing_ok=True)
     print(f"Saved {summary['variant']} validation results in {results}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except NonfinitePredictionError as error:
+        args = arguments()
+        variant = f"vlm_{args.vlm}_act_{args.act}"
+        results = RESULTS_ROOT / variant
+        results.mkdir(parents=True, exist_ok=True)
+        (results / "failure.json").write_text(
+            json.dumps({"variant": variant, "status": "nonfinite", "error": str(error)},
+                       indent=2) + "\n", encoding="utf-8"
+        )
+        print(f"{variant} failed numerically: {error}", file=sys.stderr)
+        sys.exit(3)
